@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the Android hello APK and install it on a connected device, then open it.
-# Needs adb (in PATH) and one device attached: ./push.sh
+# Needs adb (in PATH) and one device attached: ./sideload-apk.sh
 set -e
 cd "$(dirname "$0")"
 
