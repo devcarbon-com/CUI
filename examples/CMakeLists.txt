@@ -1,6 +1,10 @@
 function(cui_example name)
     add_executable(${name} ${ARGN})
     target_link_libraries(${name} PRIVATE cui::cui)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        target_compile_options(${name} PRIVATE -include cui/cui_ios_main.h)
+        set_target_properties(${name} PROPERTIES MACOSX_BUNDLE ON)
+    endif()
     cui_app_target(${name})   # no console on Windows, and only the library code the example calls
     if(APPLE)
         set_target_properties(${name} PROPERTIES MACOSX_BUNDLE OFF)
