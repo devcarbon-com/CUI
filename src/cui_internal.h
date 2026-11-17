@@ -587,6 +587,10 @@ struct cui_ctx {
         float first_x, first_y, last_x, last_y;
     } pending_clicks;               /* input collected before the frame clock advances */
     float scroll_dx, scroll_dy;
+    /* multi-touch; fingers land in slot 0..CUI_TOUCH_MAX-1 as the platform
+     * reports them, and the per-frame pressed/released flags reset each frame */
+    bool tdown[CUI_TOUCH_MAX], tpressed[CUI_TOUCH_MAX], treleased[CUI_TOUCH_MAX];
+    float tx[CUI_TOUCH_MAX], ty[CUI_TOUCH_MAX];
     bool kdown[CUI_KEY_COUNT];
     uint8_t kpressed[CUI_KEY_COUNT];
     int mods;

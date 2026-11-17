@@ -1,9 +1,12 @@
 /* Native file dialogs and URL opening, shared by every backend on a given
  * operating system: Win32 common dialogs, AppleScript on macOS, and zenity or
- * kdialog on Linux and BSD. */
+ * kdialog on Linux and BSD. Android (no dialogs, no URLs from the backend) and
+ * iOS (its own delegate provides both) define these in their backend file. */
 #include "cui_platform.h"
 
-#if defined(_WIN32)
+#if defined(__ANDROID__)
+/* both functions are in the android backend */
+#elif defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif

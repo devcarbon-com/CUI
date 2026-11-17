@@ -267,19 +267,23 @@ typedef enum cui_cursor {
  * points, then register again. Legacy replay retains existing text-size limits.
  * The caller owns queue limits and error policy.
  * Key events preserve each call, including repeated down and modifier-only
- * CUI_KEY_NONE events. File drops are not intercepted by this interface. */
+ * CUI_KEY_NONE events. Touch events (cui_input_touch and cui_input_touch_move)
+ * also pass through this interface as CUI_INPUT_TOUCH and CUI_INPUT_TOUCH_MOVE.
+ * File drops are not intercepted by this interface. */
 typedef enum cui_input_event_kind {
     CUI_INPUT_MOUSE_MOVE, CUI_INPUT_MOUSE_BUTTON, CUI_INPUT_MOUSE_LEAVE,
-    CUI_INPUT_SCROLL, CUI_INPUT_KEY, CUI_INPUT_TEXT, CUI_INPUT_FOCUS
+    CUI_INPUT_SCROLL, CUI_INPUT_KEY, CUI_INPUT_TEXT, CUI_INPUT_FOCUS,
+    CUI_INPUT_TOUCH, CUI_INPUT_TOUCH_MOVE
 } cui_input_event_kind;
 typedef struct cui_input_event {
     cui_input_event_kind kind;
-    cui_vec2 position;          /* mouse move only */
+    cui_vec2 position;          /* mouse move and touch only */
     cui_vec2 delta;             /* scroll only, same units as cui_input_scroll */
     cui_mouse_button button;   /* mouse button only */
     cui_key key;               /* key only */
     int mods;                  /* key only; track modifier-only events too */
-    bool down;                 /* key/button only */
+    int finger;                /* touch only */
+    bool down;                 /* key/button/touch only */
     bool focused;              /* window focus only */
     const char *text;          /* text only; NUL terminated, borrowed */
 } cui_input_event;
@@ -312,6 +316,21 @@ CUI_API void cui_input_scroll(cui_ctx *ui, float dx, float dy);  /* in lines; +d
 CUI_API void cui_input_key(cui_ctx *ui, cui_key key, bool down, int mods);
 CUI_API void cui_input_text(cui_ctx *ui, const char *utf8);
 CUI_API void cui_input_focus(cui_ctx *ui, bool window_focused);
+
+/* Raw multi-touch, for apps and touch-first components. Fingers are numbered
+ * by the platform (0 is usually the first finger to land). The mouse API
+ * keeps working beside this: a backend may feed both. */
+#define CUI_TOUCH_MAX 10
+CUI_API void cui_input_touch(cui_ctx *ui, int finger, bool down, float x, float y);
+CUI_API void cui_input_touch_move(cui_ctx *ui, int finger, float x, float y);
+CUI_API void cui_input_touch_cancel(cui_ctx *ui, int finger);   /* a system gesture stole the finger */
+/* Touches this frame: count, per-finger state and position; finger -1 reads
+ * the oldest touch still down. */
+CUI_API int cui_touch_count(cui_ctx *ui);
+CUI_API bool cui_touch_down(cui_ctx *ui, int finger);
+CUI_API bool cui_touch_pressed(cui_ctx *ui, int finger);   /* landed this frame */
+CUI_API bool cui_touch_released(cui_ctx *ui, int finger);  /* lifted this frame */
+CUI_API cui_vec2 cui_touch_pos(cui_ctx *ui, int finger);
 /* Files dragged from the OS: hover while a drag is over the window (where the
  * platform reports it), then the drop itself. Paths are UTF-8 and copied. */
 CUI_API void cui_input_file_hover(cui_ctx *ui, bool hovering, float x, float y);
