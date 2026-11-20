@@ -27,6 +27,8 @@ typedef struct {
     float scale;
     int down_x, down_y;    /* last finger position in window pixels */
     bool has_pointer;
+    int tracked_id;        /* motion pointer id that owns the mouse (-1 none) */
+    bool vsync;            /* swap interval to reapply when the surface is recreated */
 } cui__android;
 
 static cui__android *cui__a(cui_app *app) { return app->plat; }
@@ -57,22 +59,36 @@ bool cui__plat_open_url(const char *url) {
     if (!act) return false;
     JNIEnv *env = cui__android_jni(act);
     if (!env) return false;
+    bool ok = false;
     jstring jurl = (*env)->NewStringUTF(env, url);
-    jclass clazz = (*env)->GetObjectClass(env, act->activity->clazz);
-    jmethodID start = (*env)->GetMethodID(env, clazz, "startActivity",
-        "(Landroid/content/Intent;)V");
-    jclass intent_cls = (*env)->FindClass(env, "android/content/Intent");
-    jmethodID new_intent = (*env)->GetStaticMethodID(env, intent_cls, "<init>",
-        "(Ljava/lang/String;Ljava/lang/String;)V");
-    jstring action = (*env)->NewStringUTF(env, "android.intent.action.VIEW");
-    jobject intent = (*env)->NewObject(env, intent_cls, new_intent, action, jurl);
-    (*env)->CallVoidMethod(env, act->activity->clazz, start, intent);
+    jclass uri_cls = (*env)->FindClass(env, "android/net/Uri");
+    jmethodID parse = uri_cls ? (*env)->GetStaticMethodID(env, uri_cls, "parse",
+        "(Ljava/lang/String;)Landroid/net/Uri;") : NULL;
+    jobject juri = (uri_cls && parse) ? (*env)->CallStaticObjectMethod(env, uri_cls, parse, jurl) : NULL;
+    jclass intent_cls = juri ? (*env)->FindClass(env, "android/content/Intent") : NULL;
+    jmethodID new_intent = intent_cls ? (*env)->GetMethodID(env, intent_cls, "<init>",
+        "(Ljava/lang/String;Landroid/net/Uri;)V") : NULL;
+    if (intent_cls && new_intent) {
+        jstring action = (*env)->NewStringUTF(env, "android.intent.action.VIEW");
+        jobject intent = (*env)->NewObject(env, intent_cls, new_intent, action, juri);
+        if (intent && !(*env)->ExceptionCheck(env)) {
+            jclass clazz = (*env)->GetObjectClass(env, act->activity->clazz);
+            jmethodID start = (*env)->GetMethodID(env, clazz, "startActivity",
+                "(Landroid/content/Intent;)V");
+            if (start) (*env)->CallVoidMethod(env, act->activity->clazz, start, intent);
+            (*env)->DeleteLocalRef(env, clazz);
+        }
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, action);
+        if (intent) (*env)->DeleteLocalRef(env, intent);
+        ok = !(*env)->ExceptionCheck(env);
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (juri) (*env)->DeleteLocalRef(env, juri);
+    if (uri_cls) (*env)->DeleteLocalRef(env, uri_cls);
+    if (intent_cls) (*env)->DeleteLocalRef(env, intent_cls);
     (*env)->DeleteLocalRef(env, jurl);
-    (*env)->DeleteLocalRef(env, action);
-    (*env)->DeleteLocalRef(env, intent);
-    (*env)->DeleteLocalRef(env, intent_cls);
-    (*env)->DeleteLocalRef(env, clazz);
-    return !(*env)->ExceptionCheck(env);
+    return ok;
 }
 
 bool cui__plat_file_dialog(cui_app *app, const cui_file_dialog_opts *o, char *out, size_t cap) {
@@ -94,11 +110,19 @@ static void cui__android_cmd(android_app *act, int32_t cmd) {
         a->height = ANativeWindow_getHeight(w);
         /* the software renderer produces BGRA/RGBA8888 pixels */
         ANativeWindow_setBuffersGeometry(w, a->width, a->height, WINDOW_FORMAT_RGBA_8888);
+        /* rotation (or any surface loss): the EGL surface died in TERM_WINDOW
+         * while the context lived on — recreate it at the new size here, on
+         * this thread, before the next frame presents */
+        if (a->egl_ctx && !a->egl_surf) cui__plat_gl_create(app, a->vsync);
         cui_request_redraw(app->ui);
         break;
     }
     case APP_CMD_TERM_WINDOW:
-        if (a->egl_surf) { eglDestroySurface(a->egl_dpy, a->egl_surf); a->egl_surf = NULL; }
+        if (a->egl_surf) {
+            if (a->egl_ctx) eglMakeCurrent(a->egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            eglDestroySurface(a->egl_dpy, a->egl_surf);
+            a->egl_surf = EGL_NO_SURFACE;
+        }
         break;
     case APP_CMD_GAINED_FOCUS: cui_input_focus(app->ui, true); break;
     case APP_CMD_LOST_FOCUS: cui_input_focus(app->ui, false); break;
@@ -157,54 +181,89 @@ static int cui__android_mods(int32_t meta) {
     return m;
 }
 
-static void cui__android_key_event(cui_app *app, AInputEvent *ev) {
+static bool cui__android_key_event(cui_app *app, AInputEvent *ev) {
     cui_ctx *ui = app->ui;
     int32_t action = AKeyEvent_getAction(ev);
     bool down = action == AKEY_EVENT_ACTION_DOWN;
+    int32_t meta = AKeyEvent_getMetaState(ev);
     cui_key k = cui__android_key(AKeyEvent_getKeyCode(ev));
-    int mods = cui__android_mods(AKeyEvent_getMetaState(ev));
-    if (k) cui_input_key(ui, k, down, mods);
-    if (down && !k) {
+    int mods = cui__android_mods(meta);
+    bool handled = false;
+    char text[8] = "";
+    if (down && !(mods & CUI_MOD_CTRL)) {
         /* soft-keyboard text: the code point is not exposed by the C API,
-         * ask the Java KeyEvent */
+         * ask the Java KeyEvent (also for mapped keys, for shifted symbols) */
         android_app *act = cui__a(app)->act;
         JNIEnv *env = cui__android_jni(act);
         if (env) {
             jclass kc = (*env)->FindClass(env, "android/view/KeyEvent");
-            jmethodID ctor = (*env)->GetMethodID(env, kc, "<init>", "(JI)V");
-            jobject jke = (*env)->NewObject(env, kc, ctor,
+            jmethodID ctor = kc ? (*env)->GetMethodID(env, kc, "<init>", "(JJIIII)V") : NULL;
+            jobject jke = (kc && ctor && !(*env)->ExceptionCheck(env)) ? (*env)->NewObject(env, kc, ctor,
                 (jlong)AKeyEvent_getDownTime(ev), (jlong)AKeyEvent_getEventTime(ev),
-                (jint)AKeyEvent_getAction(ev), (jint)AKeyEvent_getKeyCode(ev),
+                (jint)action, (jint)AKeyEvent_getKeyCode(ev),
                 (jint)AKeyEvent_getRepeatCount(ev),
-                (jint)AKeyEvent_getMetaState(ev));
+                (jint)meta) : NULL;
             if (jke) {
                 jmethodID unicode = (*env)->GetMethodID(env, kc, "getUnicodeChar", "(I)I");
-                jint ch = (*env)->CallIntMethod(env, jke, unicode, (jint)mods);
+                jint ch = (unicode && !(*env)->ExceptionCheck(env))
+                    ? (*env)->CallIntMethod(env, jke, unicode, (jint)meta) : 0;
+                if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); ch = 0; }
                 if (ch > 0) {
-                    char buf[8];
                     int n = 0;
                     unsigned int c = (unsigned int)ch;
-                    if (c < 0x80) buf[n++] = (char)c;
-                    else if (c < 0x800) { buf[n++] = (char)(0xC0 | (c >> 6)); buf[n++] = (char)(0x80 | (c & 0x3F)); }
-                    else if (c < 0x10000) { buf[n++] = (char)(0xE0 | (c >> 12)); buf[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); buf[n++] = (char)(0x80 | (c & 0x3F)); }
-                    else { buf[n++] = (char)(0xF0 | (c >> 18)); buf[n++] = (char)(0x80 | ((c >> 12) & 0x3F)); buf[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); buf[n++] = (char)(0x80 | (c & 0x3F)); }
-                    buf[n] = 0;
-                    if (!(mods & CUI_MOD_CTRL)) cui_input_text(ui, buf);
+                    if (c < 0x80) text[n++] = (char)c;
+                    else if (c < 0x800) { text[n++] = (char)(0xC0 | (c >> 6)); text[n++] = (char)(0x80 | (c & 0x3F)); }
+                    else if (c < 0x10000) { text[n++] = (char)(0xE0 | (c >> 12)); text[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); text[n++] = (char)(0x80 | (c & 0x3F)); }
+                    else { text[n++] = (char)(0xF0 | (c >> 18)); text[n++] = (char)(0x80 | ((c >> 12) & 0x3F)); text[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); text[n++] = (char)(0x80 | (c & 0x3F)); }
+                    text[n] = 0;
                 }
                 (*env)->DeleteLocalRef(env, jke);
             }
-            (*env)->DeleteLocalRef(env, kc);
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            if (kc) (*env)->DeleteLocalRef(env, kc);
         }
     }
+    if (k) {
+        cui_input_key(ui, k, down, mods);
+        handled = true;
+    }
+    if (down && text[0] && !(mods & CUI_MOD_CTRL)) {
+        cui_input_text(ui, text);
+        handled = true;
+    }
+    return handled;
 }
 
 static void cui__android_motion_event(cui_app *app, AInputEvent *ev) {
     cui__android *a = cui__a(app);
     cui_ctx *ui = app->ui;
     float s = a->scale;
-    float x = AMotionEvent_getX(ev, 0) / s;
-    float y = AMotionEvent_getY(ev, 0) / s;
     int32_t action = AMotionEvent_getAction(ev);
+    int ptr_index = (action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+    size_t ptr_id = AMotionEvent_getPointerId(ev, ptr_index);
+    /* track the pointer that went down first so a second finger cannot
+     * hijack the mouse position while it is on the screen */
+    int idx = 0;
+    switch (action & AMOTION_EVENT_ACTION_MASK) {
+    case AMOTION_EVENT_ACTION_DOWN:
+        a->tracked_id = (int)ptr_id;
+        break;
+    case AMOTION_EVENT_ACTION_POINTER_UP:
+        if ((int)ptr_id == a->tracked_id) {
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+            a->has_pointer = false;
+            a->tracked_id = -1;
+        }
+        return;
+    case AMOTION_EVENT_ACTION_POINTER_DOWN:
+        return;   /* the tracked pointer keeps owning the mouse */
+    default: break;
+    }
+    for (size_t i = 0, n = AMotionEvent_getPointerCount(ev); i < n; i++) {
+        if ((int)AMotionEvent_getPointerId(ev, i) == a->tracked_id) { idx = (int)i; break; }
+    }
+    float x = AMotionEvent_getX(ev, idx) / s;
+    float y = AMotionEvent_getY(ev, idx) / s;
     switch (action & AMOTION_EVENT_ACTION_MASK) {
     case AMOTION_EVENT_ACTION_DOWN:
         cui_input_mouse_move(ui, x, y);
@@ -212,16 +271,18 @@ static void cui__android_motion_event(cui_app *app, AInputEvent *ev) {
         a->has_pointer = true;
         break;
     case AMOTION_EVENT_ACTION_MOVE:
-        cui_input_mouse_move(ui, x, y);
+        if (a->has_pointer) cui_input_mouse_move(ui, x, y);
         break;
     case AMOTION_EVENT_ACTION_UP:
         cui_input_mouse_move(ui, x, y);
         cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
         a->has_pointer = false;
+        a->tracked_id = -1;
         break;
     case AMOTION_EVENT_ACTION_CANCEL:
         if (a->has_pointer) cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
         a->has_pointer = false;
+        a->tracked_id = -1;
         break;
     default: break;
     }
@@ -235,8 +296,7 @@ static int32_t cui__android_input(android_app *act, AInputEvent *ev) {
         cui__android_motion_event(app, ev);
         return 1;
     case AINPUT_EVENT_TYPE_KEY:
-        cui__android_key_event(app, ev);
-        return 1;
+        return cui__android_key_event(app, ev) ? 1 : 0;
     default: return 0;
     }
 }
@@ -262,12 +322,15 @@ bool cui__plat_gl_create(cui_app *app, bool vsync) {
     cui__android *a = cui__a(app);
     android_app *act = a->act;
     if (!act->window || a->egl_dpy == EGL_NO_DISPLAY) return false;
+    a->vsync = vsync;
     if (a->egl_ctx) {
         /* surface recreated after the window came back; context is kept */
         if (a->egl_surf) eglDestroySurface(a->egl_dpy, a->egl_surf);
         a->egl_surf = eglCreateWindowSurface(a->egl_dpy, a->egl_cfg, act->window, NULL);
         if (a->egl_surf == EGL_NO_SURFACE) return false;
-        return eglMakeCurrent(a->egl_dpy, a->egl_surf, a->egl_surf, a->egl_ctx);
+        if (!eglMakeCurrent(a->egl_dpy, a->egl_surf, a->egl_surf, a->egl_ctx)) return false;
+        eglSwapInterval(a->egl_dpy, vsync ? 1 : 0);
+        return true;
     }
     a->egl_cfg = cui__android_pick_config(a->egl_dpy);
     if (!a->egl_cfg) return false;
@@ -308,15 +371,24 @@ static void cui__android_blit(cui_app *app, const void *bgra, int w, int h, int 
         int cw = pw < buf.width - px ? pw : buf.width - px;
         int ch = ph < buf.height - py ? ph : buf.height - py;
         if (cw > 0 && ch > 0) {
-            if (buf.stride == w && stride == w * 4) {
-                memcpy(dst + (size_t)py * buf.stride * 4 + (size_t)px * 4,
-                       src + (size_t)py * stride + (size_t)px * 4,
-                       (size_t)ch * w * 4);
+            if (px == 0 && cw == w && buf.stride == w && stride == w * 4) {
+                /* full rows: the software renderer's BGRA has to become the
+                 * window's RGBA, so bytes cannot just be copied */
+                for (int y = 0; y < ch; y++) {
+                    const uint8_t *s = src + (size_t)(py + y) * stride;
+                    uint8_t *d = dst + (size_t)(py + y) * buf.stride * 4;
+                    for (int x4 = 0; x4 < cw * 4; x4 += 4) {
+                        d[x4] = s[x4 + 2]; d[x4 + 1] = s[x4 + 1]; d[x4 + 2] = s[x4]; d[x4 + 3] = s[x4 + 3];
+                    }
+                }
             } else {
-                for (int y = 0; y < ch; y++)
-                    memcpy(dst + (size_t)(py + y) * buf.stride * 4 + (size_t)px * 4,
-                           src + (size_t)(py + y) * stride + (size_t)px * 4,
-                           (size_t)cw * 4);
+                for (int y = 0; y < ch; y++) {
+                    const uint8_t *s = src + (size_t)(py + y) * stride + (size_t)px * 4;
+                    uint8_t *d = dst + (size_t)(py + y) * buf.stride * 4 + (size_t)px * 4;
+                    for (int x4 = 0; x4 < cw * 4; x4 += 4) {
+                        d[x4] = s[x4 + 2]; d[x4 + 1] = s[x4 + 1]; d[x4 + 2] = s[x4]; d[x4 + 3] = s[x4 + 3];
+                    }
+                }
             }
         }
     }
@@ -343,6 +415,7 @@ bool cui__plat_init(cui_app *app) {
     a->act->userData = app;
     a->act->onAppCmd = cui__android_cmd;
     a->act->onInputEvent = cui__android_input;
+    a->tracked_id = -1;
     a->scale = cui__android_density(a->act);
     a->egl_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (a->egl_dpy != EGL_NO_DISPLAY && eglInitialize(a->egl_dpy, NULL, NULL)) {
@@ -384,6 +457,27 @@ void cui__plat_shutdown(cui_app *app) {
 double cui__plat_refresh_hz(cui_app *app) {
     (void)app;
     return 0;   /* EGL does not expose it; the app loop paces by the clock */
+}
+
+/* one fullscreen window: no window management, nothing to change or report */
+void cui__plat_maximize(cui_app *app) { (void)app; }
+void cui__plat_minimize(cui_app *app) { (void)app; }
+void cui__plat_restore(cui_app *app) { (void)app; }
+void cui__plat_set_position(cui_app *app, int x, int y) { (void)app; (void)x; (void)y; }
+
+cui_window_state cui__plat_window_state(cui_app *app) {
+    (void)app;
+    return CUI_WINDOW_NORMAL;
+}
+
+void cui__plat_placement(cui_app *app, cui_window_placement *out) {
+    cui__android *a = cui__a(app);
+    out->x = 0;
+    out->y = 0;
+    out->width = (int)((float)a->width / a->scale + 0.5f);
+    out->height = (int)((float)a->height / a->scale + 0.5f);
+    out->state = CUI_WINDOW_NORMAL;
+    out->has_position = false;
 }
 
 void cui__plat_metrics(cui_app *app, float *w, float *h, float *scale, int *fb_w, int *fb_h) {
