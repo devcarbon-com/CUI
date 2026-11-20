@@ -42,11 +42,20 @@ int cui_ios_user_main(int argc, char **argv);
 @property (nonatomic, assign) CGFloat lay_w, lay_h;      /* last size seen in layoutSubviews */
 @end
 
+/* Backspace with an empty field never reaches shouldChangeCharactersInRange:
+ * UIKit calls deleteBackward directly, so the subclass forwards it as a key */
+@interface CUIIOSField : UITextField
+@end
+
 /* set by the delegate once UIApplicationMain has built the window */
 static CUIIOSPlat *cui__ios_plat;
 static CUIIOSPlat *cui__ios_p(cui_app *app) { return app->plat ? (__bridge CUIIOSPlat *)app->plat : cui__ios_plat; }
 int cui__ios_argc;
 char **cui__ios_argv;
+/* NO while the app is active; YES from resign-active until did-become-active.
+ * iOS terminates any app that issues GL calls in the background, so the
+ * frame loop must not present while it is set. */
+static bool cui__ios_paused;
 
 /* ---- pending input from the main thread, drained on the app thread ---- */
 
@@ -158,6 +167,28 @@ int cui__plat_system_dark(void) {
 }
 @end
 
+static void cui__ios_post_backspace(void) {
+    cui__ios_event *ev = calloc(1, sizeof *ev);
+    if (!ev) return;
+    ev->kind = CUIIOS_KEY;
+    ev->key = CUI_KEY_BACKSPACE;
+    ev->key_down = true;
+    cui__ios_post(ev);
+    cui__ios_event *up = calloc(1, sizeof *up);
+    if (!up) return;
+    up->kind = CUIIOS_KEY;
+    up->key = CUI_KEY_BACKSPACE;
+    up->key_down = false;
+    cui__ios_post(up);
+}
+
+@implementation CUIIOSField
+- (void)deleteBackward {
+    /* with the field empty the delegate callback never fires */
+    cui__ios_post_backspace();
+}
+@end
+
 @implementation CUIIOSPlat
 
 /* The hidden field takes soft-keyboard input; we swallow the characters it
@@ -165,19 +196,9 @@ int cui__plat_system_dark(void) {
 - (BOOL)textField:(UITextField *)f shouldChangeCharactersInRange:(NSRange)r replacementString:(NSString *)s {
     (void)f;
     if (s.length == 0) {
-        /* empty replacement inside existing text is a backspace */
-        if (r.length > 0 && r.location != NSNotFound) {
-            cui__ios_event *ev = calloc(1, sizeof *ev);
-            ev->kind = CUIIOS_KEY;
-            ev->key = CUI_KEY_BACKSPACE;
-            ev->key_down = true;
-            cui__ios_post(ev);
-            cui__ios_event *up = calloc(1, sizeof *up);
-            up->kind = CUIIOS_KEY;
-            up->key = CUI_KEY_BACKSPACE;
-            up->key_down = false;
-            cui__ios_post(up);
-        }
+        /* an empty replacement is a backspace; when the hidden field is
+         * empty the range is empty too, so key it regardless of r.length */
+        cui__ios_post_backspace();
         return NO;
     }
     for (NSUInteger i = 0; i < s.length; ) {
@@ -231,17 +252,30 @@ int cui__plat_system_dark(void) {
 
 - (void)applicationDidBecomeActive:(UIApplication *)application {
     (void)application;
-    /* at launch [UIScreen mainScreen].bounds is a provisional size (320x480)
-     * until the scene connects, so the window, the view and the GL drawable
-     * all start wrong and nothing relayouts until the user leaves and
-     * re-enters the app; adopting the real bounds here fixes the first run */
-    CGRect b = [UIScreen mainScreen].bounds;
-    if (!CGRectEqualToRect(self.window.frame, b)) {
-        [self.window setBounds:b];
+    /* at launch the window starts at a provisional 320x480 until the scene
+     * connects; adopt the real bounds then. Only repair the provisional
+     * size: under Split View / Slide Over the window is legitimately
+     * smaller than the screen and must keep its assigned region. */
+    CGSize screen = [UIScreen mainScreen].bounds.size;
+    CGSize frame = self.window.frame.size;
+    BOOL provisional = (frame.width <= 320.5 && frame.height <= 480.5) &&
+        (screen.width > 320.5 || screen.height > 480.5);
+    if (provisional) {
+        /* setFrame, not setBounds: bounds keep the old center, leaving
+         * the resized window displaced off the display */
+        self.window.frame = [UIScreen mainScreen].bounds;
         self.view.frame = self.window.bounds;
         [self.view setNeedsLayout];
         [self.view layoutIfNeeded];
     }
+    /* GL must not touch the GPU in the background (iOS kills the app);
+     * the frame loop checks this flag before presenting */
+    cui__ios_paused = NO;
+}
+
+- (void)applicationWillResignActive:(UIApplication *)application {
+    (void)application;
+    cui__ios_paused = YES;
 }
 
 - (void)runUserMain {
@@ -264,6 +298,36 @@ int main(int argc, char *argv[]) {
     @autoreleasepool {
         return UIApplicationMain(argc, argv, nil, NSStringFromClass([CUIIOSPlat class]));
     }
+}
+
+/* ---- dialogs and URLs ----
+ * iOS has no osascript or "open": the URL goes through UIApplication,
+ * and dialogs report "not available". The Apple subprocess branch in
+ * cui_dialogs.c is compiled out on iPhone by the same TARGET_OS_IPHONE
+ * test used there. */
+
+bool cui__plat_open_url(const char *url) {
+    if (!url || !*url) return false;
+    UIApplication *app = [UIApplication sharedApplication];
+    NSURL *u = [NSURL URLWithString:@(url)];
+    if (!u) return false;
+    /* openURL:options:completionHandler: is iOS 10+; the backend targets 11.
+     * The selector returns void: the completion handler carries the result. */
+    __block bool ok = false;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [app openURL:u options:@{} completionHandler:^(bool success) {
+        ok = success;
+        dispatch_semaphore_signal(done);
+    }];
+    /* wait a moment so the caller reliably learns whether it launched */
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)10 * NSEC_PER_SEC));
+    return ok;
+}
+
+bool cui__plat_file_dialog(cui_app *app, const cui_file_dialog_opts *o, char *out, size_t cap) {
+    (void)app; (void)o;
+    if (cap) out[0] = 0;
+    return false;
 }
 
 /* ---- GL: EAGLContext on the view's CAEAGLLayer ---- */
@@ -322,7 +386,7 @@ void *cui__plat_gl_proc(const char *name) {
 
 void cui__plat_gl_swap(cui_app *app) {
     CUIIOSPlat *p = cui__ios_p(app);
-    if (p.gl) [p.gl presentRenderbuffer:GL_RENDERBUFFER];
+    if (p.gl && !cui__ios_paused) [p.gl presentRenderbuffer:GL_RENDERBUFFER];
 }
 
 void cui__plat_gl_release(cui_app *app) {
@@ -478,8 +542,14 @@ void cui__plat_wait(cui_app *app, double timeout) {
         if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     }
     pthread_mutex_lock(&cui__ios_lock);
-    if (timed) pthread_cond_timedwait(&cui__ios_wake, &cui__ios_lock, &ts);
-    else if (timeout < 0) pthread_cond_wait(&cui__ios_wake, &cui__ios_lock);
+    /* events can land between the last drain and this wait: only sleep
+     * while the queue is actually empty, and re-check after each wakeup */
+    while (timeout < 0 && !cui__ios_head) pthread_cond_wait(&cui__ios_wake, &cui__ios_lock);
+    if (timed) {
+        while (timeout > 0 && !cui__ios_head) {
+            if (pthread_cond_timedwait(&cui__ios_wake, &cui__ios_lock, &ts) == ETIMEDOUT) break;
+        }
+    }
     pthread_mutex_unlock(&cui__ios_lock);
     cui__ios_drain(app->ui);
 }

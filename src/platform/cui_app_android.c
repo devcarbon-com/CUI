@@ -71,17 +71,19 @@ bool cui__plat_open_url(const char *url) {
     if (intent_cls && new_intent) {
         jstring action = (*env)->NewStringUTF(env, "android.intent.action.VIEW");
         jobject intent = (*env)->NewObject(env, intent_cls, new_intent, action, juri);
-        if (intent && !(*env)->ExceptionCheck(env)) {
+        if (intent) {
             jclass clazz = (*env)->GetObjectClass(env, act->activity->clazz);
             jmethodID start = (*env)->GetMethodID(env, clazz, "startActivity",
                 "(Landroid/content/Intent;)V");
             if (start) (*env)->CallVoidMethod(env, act->activity->clazz, start, intent);
             (*env)->DeleteLocalRef(env, clazz);
         }
+        /* ActivityNotFoundException (nothing handles the URL) or a lookup
+         * failure clears to ok=false; only an unexceptional launch is true */
+        if (!(*env)->ExceptionCheck(env)) ok = true;
         if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
         (*env)->DeleteLocalRef(env, action);
         if (intent) (*env)->DeleteLocalRef(env, intent);
-        ok = !(*env)->ExceptionCheck(env);
     }
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     if (juri) (*env)->DeleteLocalRef(env, juri);
@@ -113,7 +115,16 @@ static void cui__android_cmd(android_app *act, int32_t cmd) {
         /* rotation (or any surface loss): the EGL surface died in TERM_WINDOW
          * while the context lived on — recreate it at the new size here, on
          * this thread, before the next frame presents */
-        if (a->egl_ctx && !a->egl_surf) cui__plat_gl_create(app, a->vsync);
+        if (a->egl_ctx && !a->egl_surf) {
+            if (cui__plat_gl_create(app, a->vsync)) {
+                a->width = ANativeWindow_getWidth(w);
+                a->height = ANativeWindow_getHeight(w);
+            } else {
+                /* gl_create may have made the surface before eglMakeCurrent
+                 * failed; leave it unset so the next INIT_WINDOW retries */
+                a->egl_surf = EGL_NO_SURFACE;
+            }
+        }
         cui_request_redraw(app->ui);
         break;
     }
@@ -197,12 +208,16 @@ static bool cui__android_key_event(cui_app *app, AInputEvent *ev) {
         JNIEnv *env = cui__android_jni(act);
         if (env) {
             jclass kc = (*env)->FindClass(env, "android/view/KeyEvent");
-            jmethodID ctor = kc ? (*env)->GetMethodID(env, kc, "<init>", "(JJIIII)V") : NULL;
+            jmethodID ctor = kc ? (*env)->GetMethodID(env, kc, "<init>", "(JJIIIIII)V") : NULL;
+            /* deviceId/scancode: getUnicodeChar must use the physical
+             * keyboard's map, not VIRTUAL_KEYBOARD (German Shift+2 etc.) */
             jobject jke = (kc && ctor && !(*env)->ExceptionCheck(env)) ? (*env)->NewObject(env, kc, ctor,
                 (jlong)AKeyEvent_getDownTime(ev), (jlong)AKeyEvent_getEventTime(ev),
                 (jint)action, (jint)AKeyEvent_getKeyCode(ev),
                 (jint)AKeyEvent_getRepeatCount(ev),
-                (jint)meta) : NULL;
+                (jint)meta,
+                (jint)AInputEvent_getDeviceId(ev),
+                (jint)AKeyEvent_getScanCode(ev)) : NULL;
             if (jke) {
                 jmethodID unicode = (*env)->GetMethodID(env, kc, "getUnicodeChar", "(I)I");
                 jint ch = (unicode && !(*env)->ExceptionCheck(env))
@@ -328,7 +343,11 @@ bool cui__plat_gl_create(cui_app *app, bool vsync) {
         if (a->egl_surf) eglDestroySurface(a->egl_dpy, a->egl_surf);
         a->egl_surf = eglCreateWindowSurface(a->egl_dpy, a->egl_cfg, act->window, NULL);
         if (a->egl_surf == EGL_NO_SURFACE) return false;
-        if (!eglMakeCurrent(a->egl_dpy, a->egl_surf, a->egl_surf, a->egl_ctx)) return false;
+        if (!eglMakeCurrent(a->egl_dpy, a->egl_surf, a->egl_surf, a->egl_ctx)) {
+            eglDestroySurface(a->egl_dpy, a->egl_surf);
+            a->egl_surf = EGL_NO_SURFACE;
+            return false;
+        }
         eglSwapInterval(a->egl_dpy, vsync ? 1 : 0);
         return true;
     }

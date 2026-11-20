@@ -5,6 +5,8 @@ project(cui
     DESCRIPTION "Modern native UI components for C"
     LANGUAGES C)
 
+set(CUI_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE INTERNAL "CUI root")
+
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CUI_IS_TOP_LEVEL ON)
 else()
