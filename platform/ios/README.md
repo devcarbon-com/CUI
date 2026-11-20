@@ -15,6 +15,9 @@ Xcode; the CMake part can run anywhere with the iOS SDK installed.
   thread.
 - GL is EAGLContext (GLES 3) with the framebuffer attached to the layer's
   renderbuffer; the software renderer puts a CGImage on the layer.
+- Rotation: `layoutSubviews` on the view posts a relayout event; the next
+  frame reads the new size, and in the GL path the layer's renderbuffer is
+  reallocated (same buffer objects) before it is presented again.
 
 ## Building
 
