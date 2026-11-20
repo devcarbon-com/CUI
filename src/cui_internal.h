@@ -591,6 +591,8 @@ struct cui_ctx {
      * reports them, and the per-frame pressed/released flags reset each frame */
     bool tdown[CUI_TOUCH_MAX], tpressed[CUI_TOUCH_MAX], treleased[CUI_TOUCH_MAX];
     float tx[CUI_TOUCH_MAX], ty[CUI_TOUCH_MAX];
+    uint32_t tland[CUI_TOUCH_MAX];  /* when each slot landed; selects the first active touch */
+    uint32_t tland_seq;             /* landing-order counter for tland */
     bool kdown[CUI_KEY_COUNT];
     uint8_t kpressed[CUI_KEY_COUNT];
     int mods;

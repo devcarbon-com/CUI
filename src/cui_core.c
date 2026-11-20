@@ -586,12 +586,20 @@ static int cui__touch_first(cui_ctx *ui) {
     return -1;
 }
 
+/* the active touch that landed earliest, or -1 when nothing is down */
+static int cui__touch_first(cui_ctx *ui) {
+    int best = -1;
+    for (int i = 0; i < CUI_TOUCH_MAX; i++)
+        if (ui->tdown[i] && (best < 0 || ui->tland[i] < ui->tland[best])) best = i;
+    return best;
+}
+
 void cui_input_touch(cui_ctx *ui, int finger, bool down, float x, float y) {
     if (!cui__touch_slot(finger)) return;
     const cui_input_event event = { .kind = CUI_INPUT_TOUCH, .finger = finger, .position = {x, y}, .down = down };
     if (cui__input_handled(ui, &event)) return;
     cui__poke(ui);
-    if (down && !ui->tdown[finger]) ui->tpressed[finger] = true;
+    if (down && !ui->tdown[finger]) { ui->tpressed[finger] = true; ui->tland[finger] = ui->tland_seq++; }
     if (!down && ui->tdown[finger]) ui->treleased[finger] = true;
     ui->tdown[finger] = down;
     if (down) { ui->tx[finger] = x; ui->ty[finger] = y; }
