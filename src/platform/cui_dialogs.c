@@ -4,8 +4,8 @@
  * iOS (its own delegate provides both) define these in their backend file. */
 #include "cui_platform.h"
 
-#if defined(__ANDROID__)
-/* both functions are in the android backend */
+#if defined(__ANDROID__) || defined(CUI_PLATFORM_IOS)
+/* both functions are in the android / ios backend */
 #elif defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
