@@ -40,7 +40,6 @@ int cui_ios_user_main(int argc, char **argv);
 @property (nonatomic, assign) unsigned int renderbuffer;
 @property (nonatomic, assign) int fb_width, fb_height;   /* actual renderbuffer pixel size */
 @property (nonatomic, assign) CGFloat lay_w, lay_h;      /* last size seen in layoutSubviews */
-@property (nonatomic, assign) BOOL resized;               /* rotation: rebuild the renderbuffer */
 @end
 
 /* set by the delegate once UIApplicationMain has built the window */
@@ -143,14 +142,17 @@ int cui__plat_system_dark(void) {
     cui__ios_post(ev);
 }
 
-/* rotation and any relayout change the drawable size; wake the app thread so
- * the next frame relayouts at the new size (and rebuilds the GL framebuffer) */
+/* rotation and any relayout change the drawable size; remember the size and
+ * wake the app thread so the next frame re-checks and, in the GL path,
+ * reallocates the renderbuffer when it no longer matches. contentsScale is
+ * a layer property, so it is written here on the main thread it belongs to. */
 - (void)layoutSubviews {
     [super layoutSubviews];
+    CGFloat sc = self.window.screen ? self.window.screen.scale : [UIScreen mainScreen].scale;
+    if (self.layer.contentsScale != sc) self.layer.contentsScale = sc;
     if (self.bounds.size.width == self.lay_w && self.bounds.size.height == self.lay_h) return;
     self.lay_w = self.bounds.size.width;
     self.lay_h = self.bounds.size.height;
-    self.resized = YES;
     cui__ios_event *ev = calloc(1, sizeof *ev);
     if (ev) { ev->kind = CUIIOS_REDRAW; cui__ios_post(ev); }
 }
@@ -222,6 +224,26 @@ int cui__plat_system_dark(void) {
     self.kb_shown = NO;
 }
 
+- (UIInterfaceOrientationMask)application:(UIApplication *)application supportedInterfaceOrientationsForWindow:(UIWindow *)window {
+    (void)application; (void)window;
+    return UIInterfaceOrientationMaskAllButUpsideDown;
+}
+
+- (void)applicationDidBecomeActive:(UIApplication *)application {
+    (void)application;
+    /* at launch [UIScreen mainScreen].bounds is a provisional size (320x480)
+     * until the scene connects, so the window, the view and the GL drawable
+     * all start wrong and nothing relayouts until the user leaves and
+     * re-enters the app; adopting the real bounds here fixes the first run */
+    CGRect b = [UIScreen mainScreen].bounds;
+    if (!CGRectEqualToRect(self.window.frame, b)) {
+        [self.window setBounds:b];
+        self.view.frame = self.window.bounds;
+        [self.view setNeedsLayout];
+        [self.view layoutIfNeeded];
+    }
+}
+
 - (void)runUserMain {
     @autoreleasepool {
         cui_ios_user_main(cui__ios_argc, cui__ios_argv);
@@ -253,11 +275,17 @@ bool cui__plat_gl_create(cui_app *app, bool vsync) {
     if (!v) return false;
     EAGLContext *ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
     if (!ctx || ![EAGLContext setCurrentContext:ctx]) return false;
-    p.gl = ctx;
     CAEAGLLayer *layer = (CAEAGLLayer *)v.layer;
-    /* On iOS Simulator CAEAGLLayer falls back to a plain CALayer (no EAGL);
-     * drawableProperties then raises an unrecognized-selector exception. */
-    if (![layer isKindOfClass:[CAEAGLLayer class]]) return false;
+    /* On the simulator the CAEAGLLayer drawable never composites (render and
+     * present succeed, screen stays black), while the plain-CALayer fallback
+     * path works; on a device the layer is real and GL is used. The check
+     * sits after setCurrentContext so a bail never strands the context. */
+    if (![layer isKindOfClass:[CAEAGLLayer class]] ||
+        NSProcessInfo.processInfo.environment[@"SIMULATOR_DEVICE_NAME"] != nil) {
+        [EAGLContext setCurrentContext:nil];
+        return false;
+    }
+    p.gl = ctx;
     layer.opaque = YES;
     CGFloat scale = p.window.screen ? p.window.screen.scale : [UIScreen mainScreen].scale;
     layer.contentsScale = scale;
@@ -342,16 +370,26 @@ bool cui__plat_present_part(cui_app *app, const void *bgra, int w, int h, int st
 
 /* ---- metrics, title, native handle ---- */
 
-/* rotation: the layer changed size, so reallocate its renderbuffer storage on
- * the same framebuffer and renderbuffer objects, which the renderer keeps */
+/* the allocated drawable must match the laid-out view size × scale every
+ * frame: gl_create can run at a provisional size on a cold start (before the
+ * real window bounds are known), rotation changes bounds later, and the
+ * relayout event may already be consumed when the size is read — so the
+ * re-check must not fire only once. Reallocation is idempotent when the
+ * sizes match. Runs on the app thread with the EAGL context current. */
 static void cui__ios_fb_resize(CUIIOSPlat *p) {
     CUIIOSView *v = p.view;
     CAEAGLLayer *layer = (CAEAGLLayer *)v.layer;
     if (![layer isKindOfClass:[CAEAGLLayer class]]) return;   /* simulator fallback */
+    CGFloat sc = p.window.screen ? p.window.screen.scale : [UIScreen mainScreen].scale;
+    layer.contentsScale = sc;
+    /* explicit transaction: renderbufferStorage from a non-main thread warns
+     * when it lands in an implicit one */
+    [CATransaction begin];
     glBindFramebuffer(GL_FRAMEBUFFER, v.framebuffer);
     glBindRenderbuffer(GL_RENDERBUFFER, v.renderbuffer);
     [p.gl renderbufferStorage:GL_RENDERBUFFER fromDrawable:layer];
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, v.renderbuffer);
+    [CATransaction commit];
     GLint rbw = 0, rbh = 0;
     glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &rbw);
     glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &rbh);
@@ -361,11 +399,16 @@ static void cui__ios_fb_resize(CUIIOSPlat *p) {
 
 void cui__plat_metrics(cui_app *app, float *w, float *h, float *scale, int *fb_w, int *fb_h) {
     CUIIOSPlat *p = cui__ios_p(app);
-    if (p.view.resized) {
-        p.view.resized = NO;
-        if (p.gl) cui__ios_fb_resize(p);   /* app thread: the EAGL context is current here */
+    CUIIOSView *v = p.view;
+    if (v && v.framebuffer && p.gl && v.lay_w > 0 && v.lay_h > 0) {
+        CGFloat sc = p.window.screen ? p.window.screen.scale : [UIScreen mainScreen].scale;
+        int want_w = (int)(v.lay_w * sc + 0.5);
+        int want_h = (int)(v.lay_h * sc + 0.5);
+        if (want_w != v.fb_width || want_h != v.fb_height) {
+            cui__ios_fb_resize(p);
+        }
     }
-    CGRect b = p.view ? p.view.bounds : [UIScreen mainScreen].bounds;
+    CGRect b = v ? v.bounds : [UIScreen mainScreen].bounds;
     float s = (float)(p.window.screen ? p.window.screen.scale : [UIScreen mainScreen].scale);
     const char *env = getenv("CUI_SCALE");
     if (env) { float e = (float)atof(env); if (e > 0.25f && e < 8) s = e; }
@@ -395,7 +438,6 @@ cui_window_state cui__plat_window_state(cui_app *app) {
 void cui__plat_placement(cui_app *app, cui_window_placement *out) {
     CUIIOSPlat *p = cui__ios_p(app);
     CGRect b = p.view ? p.view.bounds : [UIScreen mainScreen].bounds;
-    float s = (float)(p.window.screen ? p.window.screen.scale : [UIScreen mainScreen].scale);
     out->x = 0;
     out->y = 0;
     out->width = (int)(b.size.width + 0.5);

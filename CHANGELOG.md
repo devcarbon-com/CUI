@@ -74,6 +74,16 @@ What changed in CUI, newest first. Every component mentioned here runs live in t
 
 ### Fixed
 
+- The iOS backend rendered nothing on the first launch: iOS sizes a scene
+  without a `UILaunchScreen` at a provisional 320x480 at `[UIScreen
+  mainScreen].bounds`, so the window, view and GL drawable started wrong and
+  only a leave-and-revisit fixed them. iOS example bundles now ship a launch
+  screen plist, and the delegate adopts the scene's real bounds in
+  `applicationDidBecomeActive`; the drawable is re-checked against the laid-out
+  view size every frame. On the simulator `CAEAGLLayer` also never composites
+  (render and present succeed on a black screen), so the backend now falls
+  back to the software renderer there by environment check rather than only by
+  layer class.
 - Enter and Space on a focused month calendar activate the selected day, also when the pointer rests on another day ([#124](https://github.com/yappologistic/CUI/issues/124)).
 - The single-file build compiles with GCC 15 at `-O3` and `-Werror=array-bounds`; CI now checks it ([#123](https://github.com/yappologistic/CUI/issues/123)).
 - macOS Metal renderer: the window's content no longer jitters while the window is dragged to a new size. Each frame drawn during the drag is shown together with the new window size, as the software renderer's already are.

@@ -45,8 +45,14 @@ xcrun simctl launch booted org.cui.hello && xcrun simctl io booted screenshot sh
 ## Simulator notes
 
 - On the simulator `CAEAGLLayer` falls back to a plain `CALayer` (no EAGL),
-  so `cui__plat_gl_create` bails out through an `isKindOfClass` check and
-  the app runs the software renderer. On a device the GL renderer is used.
+  and even the class-fallback drawable composites black; `cui__plat_gl_create`
+  therefore rejects the simulator by environment check and the app runs the
+  software renderer. On a device the GL renderer is used.
+- Without a `UILaunchScreen` in the bundle (see `Info.plist.in`), iOS starts
+  the scene at a provisional 320x480 and the first run draws nothing until
+  the app is left and reopened; the generated example bundles carry the
+  launch screen and the delegate re-syncs the window in
+  `applicationDidBecomeActive`.
 - Touches are handled by `CUIIOSView`, not the app delegate — a
   `UIApplicationDelegate` never sees them through the responder chain.
 
