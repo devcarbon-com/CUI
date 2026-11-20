@@ -14,4 +14,10 @@
 
 #define main cui_ios_user_main
 
+/* C++ apps: give the renamed entry C linkage so its symbol matches the one
+ * the Objective-C backend calls (the macro alone would mangle it) */
+#ifdef __cplusplus
+extern "C" int cui_ios_user_main(int argc, char **argv);
+#endif
+
 #endif
