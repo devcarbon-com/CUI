@@ -6,7 +6,7 @@ function(cui_example name)
         set_target_properties(${name} PROPERTIES MACOSX_BUNDLE ON)
     endif()
     cui_app_target(${name})   # no console on Windows, and only the library code the example calls
-    if(APPLE)
+    if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         set_target_properties(${name} PROPERTIES MACOSX_BUNDLE OFF)
     endif()
 endfunction()

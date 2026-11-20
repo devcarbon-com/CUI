@@ -9,9 +9,11 @@
 # be overridden from the command line.
 set(CMAKE_SYSTEM_NAME iOS)
 # Default to the simulator SDK (pick a real device by passing
-# -DCMAKE_OSX_SYSROOT=iphoneos); either way the binaries stay runnable —
+# -DCMAKE_OSX_SYSROOT=iphoneos); not FORCE so a caller-supplied SDK wins —
 # device binaries are marked platform=iOS and the simulator rejects them.
-set(CMAKE_OSX_SYSROOT iphonesimulator CACHE STRING "" FORCE)
+if(NOT CMAKE_OSX_SYSROOT)
+    set(CMAKE_OSX_SYSROOT iphonesimulator CACHE STRING "")
+endif()
 set(CUI_PLATFORM "ios" CACHE STRING "CUI window backend" FORCE)
 set(CUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 

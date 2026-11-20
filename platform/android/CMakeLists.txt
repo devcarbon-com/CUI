@@ -42,5 +42,10 @@ target_include_directories(cui PUBLIC ${CUI_ANDROID_GLUE})
 add_library(${CUI_ANDROID_APP} SHARED ${CMAKE_CURRENT_LIST_DIR}/../../examples/${CUI_ANDROID_APP}.c)
 # whole-archive: nothing references ANativeActivity_onCreate at link time (the
 # JVM looks it up at runtime), so a plain link drops the glue object
+# 16 KB (and common) page alignment: required for Play distribution since NDK r27
+# and expected with r26's 16 KB device support
+target_link_options(${CUI_ANDROID_APP} PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384")
 target_link_libraries(${CUI_ANDROID_APP} PRIVATE cui
     -Wl,--whole-archive cui_glue -Wl,--no-whole-archive)
