@@ -4,7 +4,7 @@ function(cui_example name)
     if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         target_compile_options(${name} PRIVATE -include cui/cui_ios_main.h)
         set_target_properties(${name} PROPERTIES MACOSX_BUNDLE ON
-            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/platform/ios/Info.plist.in")
+            MACOSX_BUNDLE_INFO_PLIST "${CUI_SOURCE_DIR}/platform/ios/Info.plist.in")
     endif()
     cui_app_target(${name})   # no console on Windows, and only the library code the example calls
     if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
