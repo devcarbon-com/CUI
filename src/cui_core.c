@@ -581,13 +581,6 @@ static bool cui__touch_slot(int finger) { return finger >= 0 && finger < CUI_TOU
 
 /* the active touch that landed earliest, or -1 when nothing is down */
 static int cui__touch_first(cui_ctx *ui) {
-    for (int i = 0; i < CUI_TOUCH_MAX; i++)
-        if (ui->tdown[i]) return i;
-    return -1;
-}
-
-/* the active touch that landed earliest, or -1 when nothing is down */
-static int cui__touch_first(cui_ctx *ui) {
     int best = -1;
     for (int i = 0; i < CUI_TOUCH_MAX; i++)
         if (ui->tdown[i] && (best < 0 || ui->tland[i] < ui->tland[best])) best = i;

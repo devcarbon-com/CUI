@@ -10526,9 +10526,142 @@ static void test_emoji_release(void) {
 
 /** Share one software renderer across the test contexts and return a failing
  * exit status to CTest if any check in the suite fails. */
+static int g_touch_hook_seen;
+static bool touch_hook(cui_ctx *ui, const cui_input_event *e, void *u) {
+    (void)ui; (void)u;
+    if (e->kind == CUI_INPUT_TOUCH || e->kind == CUI_INPUT_TOUCH_MOVE) g_touch_hook_seen++;
+    return false;
+}
+
+/* per-frame touch flags are cleared at end_frame, so sample them in-frame */
+typedef struct { int finger; bool down, pressed, released; cui_vec2 pos; } touch_probe;
+static void build_touch_probe(cui_ctx *ui, void *u) {
+    touch_probe *p = u;
+    p->down = cui_touch_down(ui, p->finger);
+    p->pressed = cui_touch_pressed(ui, p->finger);
+    p->released = cui_touch_released(ui, p->finger);
+    p->pos = cui_touch_pos(ui, p->finger);
+}
+static touch_probe probe(cui_ctx *ui, int finger) {
+    touch_probe p = { .finger = finger };
+    run(ui, build_touch_probe, &p, 1);
+    return p;
+}
+
+static void test_touch_api(void) {
+    printf("interaction: raw multi-touch\n");
+    cui_ctx *ui = new_ctx();
+    run(ui, build_empty, NULL, 1);
+
+    /* press, move, release; per-frame flags */
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.down && !p.pressed && !p.released);
+    }
+    cui_input_touch(ui, 0, true, 10, 20);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(p.down && p.pressed && !p.released);
+        CHECK_NEAR(p.pos.x, 10, 0.01f);
+        CHECK_NEAR(p.pos.y, 20, 0.01f);
+    }
+    cui_input_touch_move(ui, 0, 30, 40);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(p.down && !p.pressed && !p.released);
+        CHECK_NEAR(p.pos.x, 30, 0.01f);
+        CHECK_NEAR(p.pos.y, 40, 0.01f);
+    }
+    cui_input_touch(ui, 0, false, 30, 40);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.down && p.released && !p.pressed);
+    }
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.released && !p.pressed);   /* released lasts one frame */
+    }
+
+    /* two fingers; finger -1 is the touch that landed first */
+    cui_input_touch(ui, 0, true, 1, 1);
+    probe(ui, 0);
+    cui_input_touch(ui, 1, true, 2, 2);
+    {
+        touch_probe p = probe(ui, -1);
+        CHECK(cui_touch_count(ui) == 2);
+        CHECK(p.down && cui_touch_down(ui, 0) && cui_touch_down(ui, 1));
+        CHECK_NEAR(p.pos.x, 1, 0.01f);
+    }
+    /* the first finger lifts: -1 moves to the second */
+    cui_input_touch(ui, 0, false, 1, 1);
+    {
+        touch_probe p = probe(ui, -1);
+        CHECK(cui_touch_count(ui) == 1);
+        CHECK_NEAR(p.pos.x, 2, 0.01f);
+    }
+    /* a new press after release lands later than the still-down finger */
+    cui_input_touch(ui, 0, true, 3, 3);
+    {
+        touch_probe p = probe(ui, -1);
+        CHECK_NEAR(p.pos.x, 2, 0.01f);
+    }
+    cui_input_touch(ui, 1, false, 2, 2);
+    cui_input_touch(ui, 0, false, 3, 3);
+    {
+        touch_probe p = probe(ui, -1);
+        CHECK(cui_touch_count(ui) == 0);
+        CHECK(!p.down);
+        CHECK_NEAR(p.pos.x, -1e6f, 1.0f);   /* nothing down: the off-screen rest value */
+    }
+
+    /* cancel releases without a normal lift */
+    cui_input_touch(ui, 0, true, 5, 5);
+    probe(ui, 0);
+    cui_input_touch_cancel(ui, 0);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.down && p.released);
+    }
+
+    /* out-of-range fingers are ignored everywhere */
+    cui_input_touch(ui, -5, true, 0, 0);
+    cui_input_touch(ui, CUI_TOUCH_MAX, true, 0, 0);
+    cui_input_touch_move(ui, CUI_TOUCH_MAX + 3, 1, 1);
+    {
+        touch_probe p = probe(ui, CUI_TOUCH_MAX);
+        CHECK(cui_touch_count(ui) == 0);
+        CHECK(!p.down && !cui_touch_pressed(ui, 99));
+        CHECK(!cui_touch_released(ui, -7));
+        CHECK_NEAR(p.pos.x, -1e6f, 1.0f);
+    }
+
+    /* a move for a finger that is not down is dropped */
+    cui_input_touch_move(ui, 4, 9, 9);
+    {
+        touch_probe p = probe(ui, 4);
+        CHECK(!p.down);
+    }
+
+    /* the input hook sees touch events */
+    g_touch_hook_seen = 0;
+    cui_set_input_hook(ui, touch_hook, NULL);
+    cui_input_touch(ui, 0, true, 7, 8);
+    run(ui, build_empty, NULL, 1);
+    CHECK(g_touch_hook_seen == 1);
+    cui_input_touch_move(ui, 0, 8, 9);
+    run(ui, build_empty, NULL, 1);
+    CHECK(g_touch_hook_seen == 2);
+    cui_set_input_hook(ui, NULL, NULL);
+    cui_input_touch(ui, 0, false, 8, 9);
+    run(ui, build_empty, NULL, 1);
+
+    cui_destroy(ui);
+}
+
 int main(void) {
     g_sw = cui_sw_create();
     test_color();
+    test_touch_api();
     test_state_store_grow();
     test_layout_row();
     test_layout_wrap();

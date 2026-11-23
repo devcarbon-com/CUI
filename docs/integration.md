@@ -97,6 +97,31 @@ A custom component can request a cursor with `cui_set_cursor` during submission
 or painting. The platform receives the last cursor requested that frame.
 The next frame starts with the arrow cursor.
 
+## Touch input
+
+A touch platform feeds the raw multi-touch API instead of the mouse. Fingers are
+numbered by slot (0 to `CUI_TOUCH_MAX - 1`); your platform backend picks the
+slot, keeps it for the life of the touch and reports moves and lifts through it:
+
+```c
+cui_input_touch(ui, finger, down, x, y);   /* a finger lands or lifts */
+cui_input_touch_move(ui, finger, x, y);    /* it slides */
+cui_input_touch_cancel(ui, finger);        /* a system gesture steals it */
+```
+
+In the frame loop, `cui_touch_down`, `cui_touch_pressed` and
+`cui_touch_released` report the state and the per-frame edge flags (the edges
+hold for one frame, like the mouse ones), and `cui_touch_pos` returns the
+position. Pass -1 as the finger to ask about the touch that landed first; when
+nothing is down, `cui_touch_down(-1)` is false and `cui_touch_pos(-1)` is off
+screen (-1e6). `cui_touch_count` reports how many fingers are down. The
+optional input hook (`cui_set_input_hook`) also sees touches, as
+`CUI_INPUT_TOUCH` and `CUI_INPUT_TOUCH_MOVE` events with the `finger` field
+set. Touch does not drive the mouse: a component that only listens to the mouse
+ignores it, so a touch-first app either uses components with explicit touch
+support or maps the first finger to the mouse itself (the built-in Android
+backend does the latter).
+
 ## Using the built-in backends with your loop
 
 The SDL2 and GLFW backends are complete `cui_app` implementations (`-DCUI_PLATFORM=sdl2` or `glfw`). Read `src/platform/cui_app_sdl2.c` for a compact, real example of the integration above: about 250 lines including the key map.
