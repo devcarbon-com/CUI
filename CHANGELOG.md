@@ -85,6 +85,7 @@ What changed in CUI, newest first. Every component mentioned here runs live in t
   back to the software renderer there by environment check rather than only by
   layer class.
 - Enter and Space on a focused month calendar activate the selected day, also when the pointer rests on another day ([#124](https://github.com/yappologistic/CUI/issues/124)).
+- A touch move is offered to the input hook even when no touch is down, so a consuming hook sees down, move and up in order.
 - The single-file build compiles with GCC 15 at `-O3` and `-Werror=array-bounds`; CI now checks it ([#123](https://github.com/yappologistic/CUI/issues/123)).
 - macOS Metal renderer: the window's content no longer jitters while the window is dragged to a new size. Each frame drawn during the drag is shown together with the new window size, as the software renderer's already are.
 - Windows: the native open and save dialogs leave the process's current directory where it was. A save dialog suggesting another directory could return with the current directory moved there, which kept that directory from being deleted and changed what relative paths point to.
