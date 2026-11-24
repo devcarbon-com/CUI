@@ -592,16 +592,16 @@ void cui_input_touch(cui_ctx *ui, int finger, bool down, float x, float y) {
     const cui_input_event event = { .kind = CUI_INPUT_TOUCH, .finger = finger, .position = {x, y}, .down = down };
     if (cui__input_handled(ui, &event)) return;
     cui__poke(ui);
-    if (down && !ui->tdown[finger]) { ui->tpressed[finger] = true; ui->tland[finger] = ui->tland_seq++; }
-    if (!down && ui->tdown[finger]) ui->treleased[finger] = true;
+    if (down) { ui->tpressed[finger] = !ui->tdown[finger]; ui->tland[finger] = ui->tland_seq++; ui->tx[finger] = x; ui->ty[finger] = y; }
+    else if (ui->tdown[finger]) ui->treleased[finger] = true;
     ui->tdown[finger] = down;
-    if (down) { ui->tx[finger] = x; ui->ty[finger] = y; }
 }
 
 void cui_input_touch_move(cui_ctx *ui, int finger, float x, float y) {
-    if (!cui__touch_slot(finger) || !ui->tdown[finger]) return;
+    if (!cui__touch_slot(finger)) return;
     const cui_input_event event = { .kind = CUI_INPUT_TOUCH_MOVE, .finger = finger, .position = {x, y}, .down = true };
     if (cui__input_handled(ui, &event)) return;
+    if (!ui->tdown[finger]) return;
     if (x != ui->tx[finger] || y != ui->ty[finger]) cui__poke(ui);
     ui->tx[finger] = x; ui->ty[finger] = y;
 }

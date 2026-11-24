@@ -4,6 +4,10 @@
  * iOS (its own delegate provides both) define these in their backend file. */
 #include "cui_platform.h"
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #if defined(__ANDROID__) || TARGET_OS_IPHONE
 /* both functions are in the android / ios backend */
 #elif defined(_WIN32)

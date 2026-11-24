@@ -10533,6 +10533,15 @@ static bool touch_hook(cui_ctx *ui, const cui_input_event *e, void *u) {
     return false;
 }
 
+/* consuming hook that records the sequence of touch events it is offered */
+typedef struct { int kinds[8]; int count; } touch_capture;
+static bool touch_consume_hook(cui_ctx *ui, const cui_input_event *e, void *user) {
+    (void)ui;
+    touch_capture *c = user;
+    if (c->count < 8) c->kinds[c->count++] = e->kind;
+    return true;
+}
+
 /* per-frame touch flags are cleared at end_frame, so sample them in-frame */
 typedef struct { int finger; bool down, pressed, released; cui_vec2 pos; } touch_probe;
 static void build_touch_probe(cui_ctx *ui, void *u) {
@@ -10654,6 +10663,21 @@ static void test_touch_api(void) {
     cui_set_input_hook(ui, NULL, NULL);
     cui_input_touch(ui, 0, false, 8, 9);
     run(ui, build_empty, NULL, 1);
+
+    /* a consuming hook is offered down, move and up before legacy state */
+    touch_capture co = {0};
+    cui_set_input_hook(ui, touch_consume_hook, &co);
+    cui_input_touch(ui, 0, true, 10, 10);
+    cui_input_touch_move(ui, 0, 11, 12);
+    cui_input_touch(ui, 0, false, 11, 12);
+    CHECK(co.kinds[0] == CUI_INPUT_TOUCH && co.kinds[1] == CUI_INPUT_TOUCH_MOVE &&
+          co.kinds[2] == CUI_INPUT_TOUCH);
+    CHECK(co.count == 3);
+    cui_set_input_hook(ui, NULL, NULL);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.down);   /* consumed events never reached legacy state */
+    }
 
     cui_destroy(ui);
 }
