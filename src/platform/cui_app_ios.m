@@ -167,38 +167,40 @@ int cui__plat_system_dark(void) {
 }
 @end
 
-static void cui__ios_post_backspace(void) {
-    cui__ios_event *ev = calloc(1, sizeof *ev);
-    if (!ev) return;
-    ev->kind = CUIIOS_KEY;
-    ev->key = CUI_KEY_BACKSPACE;
-    ev->key_down = true;
-    cui__ios_post(ev);
-    cui__ios_event *up = calloc(1, sizeof *up);
-    if (!up) return;
-    up->kind = CUIIOS_KEY;
-    up->key = CUI_KEY_BACKSPACE;
-    up->key_down = false;
-    cui__ios_post(up);
+static void cui__ios_post_key(int key) {
+    for (int down = 1; down >= 0; down--) {
+        cui__ios_event *ev = calloc(1, sizeof *ev);
+        if (!ev) continue;
+        ev->kind = CUIIOS_KEY;
+        ev->key = key;
+        ev->key_down = down;
+        cui__ios_post(ev);
+    }
 }
 
 @implementation CUIIOSField
 - (void)deleteBackward {
     /* with the field empty the delegate callback never fires */
-    cui__ios_post_backspace();
+    cui__ios_post_key(CUI_KEY_BACKSPACE);
 }
 @end
-
 @implementation CUIIOSPlat
 
 /* The hidden field takes soft-keyboard input; we swallow the characters it
  * would insert ourselves so the CUI text edit owns the text. */
 - (BOOL)textField:(UITextField *)f shouldChangeCharactersInRange:(NSRange)r replacementString:(NSString *)s {
     (void)f;
+    /* the return key arrives as a newline replacement */
+    if ([s isEqualToString:@"\n"]) {
+        cui__ios_post_key(CUI_KEY_ENTER);
+        return NO;
+    }
     if (s.length == 0) {
         /* an empty replacement is a backspace; when the hidden field is
          * empty the range is empty too, so key it regardless of r.length */
-        cui__ios_post_backspace();
+        cui__ios_post_key(CUI_KEY_BACKSPACE);
+        /* keep the delete key alive: the field text is a proxy, not content */
+        f.text = @"aa";
         return NO;
     }
     for (NSUInteger i = 0; i < s.length; ) {
@@ -232,6 +234,7 @@ static void cui__ios_post_backspace(void) {
     self.field.autocorrectionType = UITextAutocorrectionTypeNo;
     self.field.autocapitalizationType = UITextAutocapitalizationTypeNone;
     self.field.delegate = self;
+    self.field.text = @"aa";   /* keep the delete key enabled; deletions get re-seeded below */
     [v addSubview:self.field];
     [self.window makeKeyAndVisible];
     cui__ios_plat = self;

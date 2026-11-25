@@ -74,6 +74,11 @@ What changed in CUI, newest first. Every component mentioned here runs live in t
 
 ### Fixed
 
+- The iOS soft keyboard's delete key stayed disabled: the hidden text field
+  never holds real characters (the delegate swallows insertions), so UIKit
+  disabled backspace and `deleteBackward` never fired. The field now claims a
+  proxy text (`@"aa"`, re-seeded by the delegate after each deletion) and
+  `hasText` stays enabled; the visible text edit still owns the real content.
 - The iOS backend rendered nothing on the first launch: iOS sizes a scene
   without a `UILaunchScreen` at a provisional 320x480 at `[UIScreen
   mainScreen].bounds`, so the window, view and GL drawable started wrong and
