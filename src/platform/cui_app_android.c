@@ -12,8 +12,6 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <jni.h>
-#include <android/log.h>
-#define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, "cui", __VA_ARGS__))
 #include <pthread.h>
 #include <time.h>
 
@@ -32,6 +30,7 @@ typedef struct {
     int tracked_id;        /* motion pointer id that owns the mouse (-1 none) */
     bool vsync;            /* swap interval to reapply when the surface is recreated */
     bool kb_shown;         /* soft keyboard requested for the current editing session */
+    int ges_w, ges_h;      /* window size when the current gesture went down */
 } cui__android;
 
 static cui__android *cui__a(cui_app *app) { return app->plat; }
@@ -212,7 +211,6 @@ static struct {
 } cui__android_textq = { PTHREAD_MUTEX_INITIALIZER };
 
 static void cui__android_textq_push(const char *utf8) {
-    LOGI("commitText: '%s'", utf8);
     pthread_mutex_lock(&cui__android_textq.lock);
     int next = (cui__android_textq.tail + 1) % 64;
     if (next != cui__android_textq.head) {
@@ -443,6 +441,23 @@ static void cui__android_motion_event(cui_app *app, AInputEvent *ev) {
     int32_t action = AMotionEvent_getAction(ev);
     int ptr_index = (action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
     size_t ptr_id = AMotionEvent_getPointerId(ev, ptr_index);
+    /* IME show/hide resizes the window (adjustResize) and the input system
+     * remaps queued events into the NEW size, so mid-gesture coordinates are
+     * off by the keyboard height. If a gesture is down and the window size it
+     * started in no longer matches, drop everything after the down: release
+     * the button at the down position and swallow the rest of the gesture. */
+    if (a->has_pointer) {
+        int w = a->act->window ? ANativeWindow_getWidth(a->act->window) : a->ges_w;
+        int h = a->act->window ? ANativeWindow_getHeight(a->act->window) : a->ges_h;
+        if (w != a->ges_w || h != a->ges_h) {
+            if ((action & AMOTION_EVENT_ACTION_MASK) != AMOTION_EVENT_ACTION_UP) return;
+            cui_input_mouse_move(ui, a->down_x / s, a->down_y / s);
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+            a->has_pointer = false;
+            a->tracked_id = -1;
+            return;
+        }
+    }
     /* track the pointer that went down first so a second finger cannot
      * hijack the mouse position while it is on the screen */
     int idx = 0;
@@ -464,10 +479,25 @@ static void cui__android_motion_event(cui_app *app, AInputEvent *ev) {
     for (size_t i = 0, n = AMotionEvent_getPointerCount(ev); i < n; i++) {
         if ((int)AMotionEvent_getPointerId(ev, i) == a->tracked_id) { idx = (int)i; break; }
     }
-    float x = AMotionEvent_getX(ev, idx) / s;
-    float y = AMotionEvent_getY(ev, idx) / s;
+    /* window-relative X/Y are unreliable on this device: the input
+     * dispatcher caches the frame from when the IME was open and keeps
+     * remapping taps by the keyboard height long after it closed. Raw
+     * screen coordinates bypass that remap; our window is top-anchored
+     * (fullscreen, adjustResize shrinks only the bottom) so raw == window
+     * in every state we draw. */
+    int raw_idx = idx;
+    if (AMotionEvent_getRawX(ev, idx) == 0 &&
+        AMotionEvent_getRawX(ev, 0) != 0) raw_idx = 0;   /* per-pointer raw unsupported */
+    float x = AMotionEvent_getRawX(ev, raw_idx) / s;
+    float y = AMotionEvent_getRawY(ev, raw_idx) / s;
     switch (action & AMOTION_EVENT_ACTION_MASK) {
     case AMOTION_EVENT_ACTION_DOWN:
+        if (a->act->window) {
+            a->ges_w = ANativeWindow_getWidth(a->act->window);
+            a->ges_h = ANativeWindow_getHeight(a->act->window);
+        }
+        a->down_x = (int)(x * s);
+        a->down_y = (int)(y * s);
         cui_input_mouse_move(ui, x, y);
         cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
         a->has_pointer = true;
@@ -493,12 +523,6 @@ static void cui__android_motion_event(cui_app *app, AInputEvent *ev) {
 static int32_t cui__android_input(android_app *act, AInputEvent *ev) {
     cui_app *app = (cui_app *)act->userData;
     if (!app) return 0;
-    if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_MOTION)
-        LOGI("motion act=%d x=%.0f y=%.0f", AMotionEvent_getAction(ev),
-            AMotionEvent_getX(ev, 0), AMotionEvent_getY(ev, 0));
-    else
-        LOGI("key act=%d code=%d flags=%x", AKeyEvent_getAction(ev),
-            AKeyEvent_getKeyCode(ev), AKeyEvent_getFlags(ev));
     switch (AInputEvent_getType(ev)) {
     case AINPUT_EVENT_TYPE_MOTION:
         cui__android_motion_event(app, ev);
@@ -714,11 +738,9 @@ void cui__plat_wait(cui_app *app, double timeout) {
     bool wants = cui_wants_keyboard(app->ui);
     if (wants && !a->kb_shown) {
         a->kb_shown = true;
-        LOGI("kb show (wants=%d)", wants);
         cui__android_show_kb(a->act, true);
     } else if (!wants && a->kb_shown) {
         a->kb_shown = false;
-        LOGI("kb hide");
         cui__android_show_kb(a->act, false);
     }
     int events = 0;

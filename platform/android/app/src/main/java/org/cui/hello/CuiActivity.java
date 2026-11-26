@@ -71,7 +71,6 @@ public class CuiActivity extends NativeActivity {
 
     /* called from the native (glue) thread; the IME must be driven on the UI thread */
     public void showKeyboard() {
-        android.util.Log.i("cui", "java showKeyboard");
         runOnUiThread(() -> {
             input.setFocusable(true);
             input.setFocusableInTouchMode(true);
@@ -82,7 +81,6 @@ public class CuiActivity extends NativeActivity {
     }
 
     public void hideKeyboard() {
-        android.util.Log.i("cui", "java hideKeyboard");
         runOnUiThread(() -> {
             InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
             if (imm != null) imm.hideSoftInputFromWindow(input.getWindowToken(), 0);

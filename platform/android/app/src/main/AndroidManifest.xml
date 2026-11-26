@@ -8,7 +8,7 @@
         <activity
             android:name="org.cui.hello.CuiActivity"
             android:exported="true"
-            android:windowSoftInputMode="adjustNothing"
+            android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode">
             <meta-data android:name="android.app.lib_name" android:value="notes" />
             <intent-filter>
