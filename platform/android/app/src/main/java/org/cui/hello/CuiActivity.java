@@ -35,6 +35,7 @@ public class CuiActivity extends NativeActivity {
     }
 
     private View input;
+    private InputConnection ic;
 
     private class CuiInputView extends View {
         CuiInputView(Context c) { super(c); }
@@ -46,7 +47,10 @@ public class CuiActivity extends NativeActivity {
         public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
             outAttrs.inputType = android.text.InputType.TYPE_CLASS_TEXT;
             outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_ACTION_NONE;
-        return new BaseInputConnection(this, false) {
+        /* kept so native editor focus changes can end compositions via
+         * resetComposition(); a fresh connection would also drop span state,
+         * but the IME must be told */
+        InputConnection conn = new BaseInputConnection(this, false) {
             int span = 0;               /* composing-span codepoints */
             String spanText = "";       /* what we typed for it */
 
@@ -106,25 +110,33 @@ public class CuiActivity extends NativeActivity {
 
             @Override
             public boolean deleteSurroundingText(int beforeLength, int afterLength) {
-                // a backspace inside the span: the following setComposingText
-                // lands at a smaller span and re-syncs us; forward the delete.
-                // Counts are in UTF-16 chars here but nativeDeleteChars
-                // deletes one codepoint per call — convert via the text we
-                // typed before the cursor so the span and screen agree.
+                // counts are UTF-16 chars, nativeDeleteChars consumes
+                // codepoints — convert the FULL requested range, not just the
+                // part inside spanText (units before it: assume 1:1, we
+                // cannot see that text from here)
                 beforeLength = Math.max(0, beforeLength);
-                int codepoints = beforeLength;
-                if (beforeLength > 0 && !spanText.isEmpty()) {
-                    /* clip to the span, then count codepoints in that chunk */
-                    int cut = Math.min(beforeLength, spanText.length());
-                    codepoints = spanText.substring(spanText.length() - cut)
-                            .codePointCount(0, cut);
-                }
+                int cut = Math.min(beforeLength, spanText.length());
+                int codepoints = (beforeLength - cut)
+                        + spanText.substring(spanText.length() - cut).codePointCount(0, cut);
                 nativeDeleteChars(codepoints);
-                span = Math.max(0, span - codepoints);
-                if (spanText.length() > 0) {
-                    int cut = Math.min(beforeLength, spanText.length());
-                    spanText = spanText.substring(0, spanText.length() - cut);
-                }
+                span = Math.max(0, span - codepoints + (beforeLength - cut));
+                if (cut > 0) spanText = spanText.substring(0, spanText.length() - cut);
+                if (afterLength > 0) nativeDeleteCharsForward(afterLength);
+                return true;
+            }
+
+            /* codepoint-count variant (API 33+); IMEs using it must NOT go
+             * through the UTF-16 conversion above — forward counts as-is */
+            @Override
+            public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
+                beforeLength = Math.max(0, beforeLength);
+                afterLength = Math.max(0, afterLength);
+                nativeDeleteChars(beforeLength);
+                span = Math.max(0, span - beforeLength);
+                int end = spanText.length();
+                for (int i = 0; i < beforeLength && end > 0; i++)
+                    end = spanText.offsetByCodePoints(end, -1);
+                spanText = spanText.substring(0, end);
                 if (afterLength > 0) nativeDeleteCharsForward(afterLength);
                 return true;
             }
@@ -139,6 +151,8 @@ public class CuiActivity extends NativeActivity {
                 return true;
             }
         };
+            ic = conn;
+            return conn;
         }
     }
 
@@ -149,6 +163,16 @@ public class CuiActivity extends NativeActivity {
         android.widget.FrameLayout.LayoutParams lp = new android.widget.FrameLayout.LayoutParams(1, 1);
         lp.gravity = Gravity.BOTTOM | Gravity.START;
         addContentView(input, lp);
+    }
+
+    /* native editor focus changed: finish the outstanding composition and
+     * restart the IME so stale composing text cannot reach the new editor */
+    public void resetComposition() {
+        runOnUiThread(() -> {
+            if (ic != null) ic.finishComposingText();
+            InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) imm.restartInput(input);
+        });
     }
 
     /* called from the native (glue) thread; the IME must be driven on the UI thread */

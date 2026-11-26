@@ -280,11 +280,13 @@ static bool cui__android_textq_push(const char *utf8) {
     int used = cap ? (cui__android_textq.tail - cui__android_textq.head + cap) % cap : 0;
     if (used == cap - 1 || cap == 0) {
         int newcap = cap ? cap * 2 : 16;
-        char **grown = realloc(cui__android_textq.items, (size_t)newcap * sizeof *grown);
+        /* separate allocation: the wrapped ring must be copied in logical
+         * order, which realloc cannot do in place */
+        char **grown = malloc((size_t)newcap * sizeof *grown);
         if (grown) {
-            /* unwrap the ring into 0..used so head stays at 0 */
             for (int i = 0; i < used; i++)
                 grown[i] = cui__android_textq.items[(cui__android_textq.head + i) % cap];
+            free(cui__android_textq.items);
             cui__android_textq.items = grown;
             cui__android_textq.head = 0;
             cui__android_textq.tail = used;
@@ -311,8 +313,13 @@ static bool cui__android_textq_push(const char *utf8) {
 static void cui__android_textq_drain(cui_app *app) {
     for (;;) {
         pthread_mutex_lock(&cui__android_textq.lock);
-        char *item = cui__android_textq.cap ? cui__android_textq.items[cui__android_textq.head] : NULL;
-        if (!item) { pthread_mutex_unlock(&cui__android_textq.lock); return; }
+        /* occupancy, not a null sentinel: a slot can only be empty because
+         * the drain nulled it, which head!=tail already excludes */
+        if (cui__android_textq.head == cui__android_textq.tail) {
+            pthread_mutex_unlock(&cui__android_textq.lock);
+            return;
+        }
+        char *item = cui__android_textq.items[cui__android_textq.head];
         cui__android_textq.items[cui__android_textq.head] = NULL;
         cui__android_textq.head = (cui__android_textq.head + 1) % cui__android_textq.cap;
         pthread_mutex_unlock(&cui__android_textq.lock);
@@ -339,10 +346,13 @@ static void cui__android_textq_drain(cui_app *app) {
                 cui_input_key(app->ui, k, false, 0);
             }
         } else if (*item == '\x04') {
-            /* deleteSurroundingText(afterLength): a forward delete; CUI's
-             * DELETE key matches one codepoint per press like BACKSPACE */
-            cui_input_key(app->ui, CUI_KEY_DELETE, true, 0);
-            cui_input_key(app->ui, CUI_KEY_DELETE, false, 0);
+            /* deleteSurroundingText(afterLength): a forward delete of n
+             * codepoints, counted like the backspace path */
+            int n = atoi(item + 1);
+            for (int i = 0; i < n; i++) {
+                cui_input_key(app->ui, CUI_KEY_DELETE, true, 0);
+                cui_input_key(app->ui, CUI_KEY_DELETE, false, 0);
+            }
         } else if (*item) {
             cui_input_text(app->ui, item);
         }
@@ -385,7 +395,9 @@ void Java_org_cui_hello_CuiActivity_nativeDeleteChars(JNIEnv *env, jobject thiz,
 __attribute__((visibility("default")))
 void Java_org_cui_hello_CuiActivity_nativeDeleteCharsForward(JNIEnv *env, jobject thiz, jint n) {
     (void)env; (void)thiz;
-    if (!cui__android_textq_push("\x04")) return;
+    char tag[24];
+    snprintf(tag, sizeof tag, "\x04%d", (int)(n > 0 ? n : 0));
+    cui__android_textq_push(tag);
 }
 
 /* soft-keyboard key event (backspace, arrows, enter) from sendKeyEvent;
@@ -400,6 +412,17 @@ void Java_org_cui_hello_CuiActivity_nativeKeyEvent(JNIEnv *env, jobject thiz, ji
 
 /* The IME must be driven from the UI thread; CuiActivity.showKeyboard posts
  * there, and its CuiInputView is the text-editor view the IME connects to. */
+static void cui__android_show_kb_reset(struct android_app *act) {
+    JNIEnv *env = cui__android_jni(act);
+    if (!env) return;
+    jclass cls = (*env)->GetObjectClass(env, act->activity->clazz);
+    jmethodID m = cls ? (*env)->GetMethodID(env, cls, "resetComposition", "()V") : NULL;
+    if (m && !(*env)->ExceptionCheck(env))
+        (*env)->CallVoidMethod(env, act->activity->clazz, m);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (cls) (*env)->DeleteLocalRef(env, cls);
+}
+
 static void cui__android_show_kb(struct android_app *act, bool show) {
     JNIEnv *env = cui__android_jni(act);
     if (!env) return;
@@ -447,7 +470,12 @@ static void cui__android_cmd(android_app *act, int32_t cmd) {
             a->egl_surf = EGL_NO_SURFACE;
         }
         break;
-    case APP_CMD_GAINED_FOCUS: cui_input_focus(app->ui, true); break;
+    case APP_CMD_GAINED_FOCUS:
+        cui_input_focus(app->ui, true);
+        /* the previous editor may still hold a composition: end it and
+         * restart the IME so its composing text cannot reach the new one */
+        cui__android_show_kb_reset(act);
+        break;
     case APP_CMD_LOST_FOCUS: cui_input_focus(app->ui, false); break;
     case APP_CMD_DESTROY: app->running = false; break;
     default: break;
@@ -588,23 +616,28 @@ static void cui__android_window_origin(cui__android *a) {
     if (!act) return;
     JNIEnv *env = cui__android_jni(act);
     if (!env) return;
+    /* receiver is a View (the surface view draws the content); on failure
+     * the exception must be cleared here, outside the guarded call below,
+     * or every later JNI call on this thread throws pending-exception */
     jclass cls = (*env)->GetObjectClass(env, act->activity->clazz);
     jmethodID loc = cls ? (*env)->GetMethodID(env, cls, "getLocationOnScreen", "([I)V") : NULL;
-    jintArray arr = loc ? (*env)->NewIntArray(env, 2) : NULL;
-    if (loc && arr) {
-        (*env)->CallVoidMethod(env, act->activity->clazz, loc, arr);
-        if (!(*env)->ExceptionCheck(env)) {
-            jint *p = (*env)->GetIntArrayElements(env, arr, NULL);
-            if (p) {
-                cui__android_win_xy[0] = p[0];
-                cui__android_win_xy[1] = p[1];
-                (*env)->ReleaseIntArrayElements(env, arr, p, JNI_ABORT);
-            }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (!loc) { if (cls) (*env)->DeleteLocalRef(env, cls); return; }
+    jintArray arr = (*env)->NewIntArray(env, 2);
+    if (!arr) { if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env); (*env)->DeleteLocalRef(env, cls); return; }
+    (*env)->CallVoidMethod(env, act->activity->clazz, loc, arr);
+    if (!(*env)->ExceptionCheck(env)) {
+        jint *p = (*env)->GetIntArrayElements(env, arr, NULL);
+        if (p) {
+            cui__android_win_xy[0] = p[0];
+            cui__android_win_xy[1] = p[1];
+            (*env)->ReleaseIntArrayElements(env, arr, p, JNI_ABORT);
         }
-        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    } else {
+        (*env)->ExceptionClear(env);
     }
-    if (arr) (*env)->DeleteLocalRef(env, arr);
-    if (cls) (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, arr);
+    (*env)->DeleteLocalRef(env, cls);
 }
 
 static void cui__android_motion_event(cui_app *app, AInputEvent *ev) {
