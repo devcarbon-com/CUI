@@ -10,7 +10,7 @@
             android:exported="true"
             android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode">
-            <meta-data android:name="android.app.lib_name" android:value="notes" />
+            <meta-data android:name="android.app.lib_name" android:value="${cuiLibName}" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

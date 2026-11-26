@@ -104,14 +104,70 @@ bool cui__plat_file_dialog(cui_app *app, const cui_file_dialog_opts *o, char *ou
 
 /* ---- clipboard: ClipboardManager over JNI ---- */
 
+static char *cui__android_clip_buf;   /* get_clipboard result, freed on next read */
+
+/* UTF-16 -> standard UTF-8 (handles surrogate pairs), like nativeCommitText */
+static char *cui__android_utf16_to_utf8(JNIEnv *env, jstring js) {
+    jsize len = (*env)->GetStringLength(env, js);
+    const jchar *u16 = (*env)->GetStringChars(env, js, NULL);
+    if (!u16) return NULL;
+    char *utf8 = malloc((size_t)len * 4 + 1);
+    if (utf8) {
+        int n = 0;
+        for (jsize i = 0; i < len; ) {
+            unsigned int c = u16[i++];
+            if (c >= 0xD800 && c <= 0xDBFF && i < len && u16[i] >= 0xDC00 && u16[i] <= 0xDFFF)
+                c = 0x10000 + ((c - 0xD800) << 10) + (u16[i++] - 0xDC00);
+            else if (c >= 0xD800 && c <= 0xDFFF)
+                continue; /* lone surrogate: skip */
+            if (c < 0x80) utf8[n++] = (char)c;
+            else if (c < 0x800) { utf8[n++] = (char)(0xC0 | (c >> 6)); utf8[n++] = (char)(0x80 | (c & 0x3F)); }
+            else if (c < 0x10000) { utf8[n++] = (char)(0xE0 | (c >> 12)); utf8[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); utf8[n++] = (char)(0x80 | (c & 0x3F)); }
+            else { utf8[n++] = (char)(0xF0 | (c >> 18)); utf8[n++] = (char)(0x80 | ((c >> 12) & 0x3F)); utf8[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); utf8[n++] = (char)(0x80 | (c & 0x3F)); }
+        }
+        utf8[n] = 0;
+    }
+    (*env)->ReleaseStringChars(env, js, u16);
+    return utf8;
+}
+
 static void cui__android_set_clipboard(void *user, const char *utf8) {
     (void)user;
     android_app *act = cui__android_activity;
     if (!act || !utf8) return;
     JNIEnv *env = cui__android_jni(act);
     if (!env) return;
-    jstring jtext = (*env)->NewStringUTF(env, utf8);
-    if (!jtext) { (*env)->ExceptionClear(env); return; }
+    /* NewStringUTF expects modified UTF-8 and mangles supplementary code
+     * points; NewString takes UTF-16, so count then convert */
+    size_t nchars = 0;
+    for (const char *p = utf8; *p; ) {
+        unsigned char b = (unsigned char)*p;
+        int len = b < 0x80 ? 1 : (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : 4;
+        p += len;
+        nchars += len == 4 ? 2 : 1;
+    }
+    jchar *u16 = malloc((nchars + 1) * sizeof *u16);
+    if (!u16) return;
+    size_t w = 0;
+    for (const char *p = utf8; *p; ) {
+        unsigned char b = (unsigned char)*p;
+        int len = b < 0x80 ? 1 : (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : 4;
+        unsigned int c = 0;
+        if (len == 1) c = *p++;
+        else if (len == 2) { c = (*p++ & 0x1F) << 6; c |= *p++ & 0x3F; }
+        else if (len == 3) { c = (*p++ & 0x0F) << 12; c |= (*p++ & 0x3F) << 6; c |= *p++ & 0x3F; }
+        else { c = (*p++ & 0x07) << 18; c |= (*p++ & 0x3F) << 12; c |= (*p++ & 0x3F) << 6; c |= *p++ & 0x3F; }
+        if (c >= 0x10000) {
+            c -= 0x10000;
+            u16[w++] = (jchar)(0xD800 + (c >> 10));
+            u16[w++] = (jchar)(0xDC00 + (c & 0x3FF));
+        } else {
+            u16[w++] = (jchar)c;
+        }
+    }
+    jstring jtext = (*env)->NewString(env, u16, (jsize)w);
+    free(u16);
+    if (!jtext || (*env)->ExceptionCheck(env)) { if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env); return; }
     jclass ctx_cls = (*env)->GetObjectClass(env, act->activity->clazz);
     jfieldID svc_field = (*env)->GetStaticFieldID(env, ctx_cls, "CLIPBOARD_SERVICE",
         "Ljava/lang/String;");
@@ -149,6 +205,9 @@ static const char *cui__android_get_clipboard(void *user) {
     if (!act) return "";
     JNIEnv *env = cui__android_jni(act);
     if (!env) return "";
+    /* PushPopLocalFrame discards every local ref created inside with one pop,
+     * so no class/method/string leaks accumulate per clipboard read */
+    if ((*env)->PushLocalFrame(env, 16) != 0) return "";
     jclass ctx_cls = (*env)->GetObjectClass(env, act->activity->clazz);
     jfieldID svc_field = (*env)->GetStaticFieldID(env, ctx_cls, "CLIPBOARD_SERVICE",
         "Ljava/lang/String;");
@@ -156,6 +215,7 @@ static const char *cui__android_get_clipboard(void *user) {
     jmethodID get_sys = svc ? (*env)->GetMethodID(env, ctx_cls, "getSystemService",
         "(Ljava/lang/String;)Ljava/lang/Object;") : NULL;
     jobject cm = (svc && get_sys) ? (*env)->CallObjectMethod(env, act->activity->clazz, get_sys, svc) : NULL;
+    char *result = NULL;
     if (cm) {
         jclass cm_cls = (*env)->GetObjectClass(env, cm);
         jmethodID get_primary = (*env)->GetMethodID(env, cm_cls, "getPrimaryClip",
@@ -176,27 +236,23 @@ static const char *cui__android_get_clipboard(void *user) {
                     jmethodID to_str = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, text),
                         "toString", "()Ljava/lang/String;");
                     jstring jstr = to_str ? (*env)->CallObjectMethod(env, text, to_str) : NULL;
-                    if (jstr) {
-                        const char *utf8 = (*env)->GetStringUTFChars(env, jstr, NULL);
-                        if (utf8) {
-                            /* truncated clipboard is better than a crash: cui caps at 8MB */
-                            static char buf[1 << 16];
-                            snprintf(buf, sizeof buf, "%s", utf8);
-                            (*env)->ReleaseStringUTFChars(env, jstr, utf8);
-                            return buf;
-                        }
+                    if (jstr && !(*env)->ExceptionCheck(env)) {
+                        /* GetStringUTFChars is modified UTF-8 (emoji become
+                         * 6-byte surrogate encodings); read UTF-16 and convert
+                         * to standard UTF-8. Heap-allocated, no 64 KiB cap —
+                         * cui cores at 8 MiB on its own. */
+                        result = cui__android_utf16_to_utf8(env, jstr);
                     }
                 }
             }
         }
         if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-        (*env)->DeleteLocalRef(env, cm_cls);
     }
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-    (*env)->DeleteLocalRef(env, ctx_cls);
-    if (svc) (*env)->DeleteLocalRef(env, svc);
-    if (cm) (*env)->DeleteLocalRef(env, cm);
-    return "";
+    (*env)->PopLocalFrame(env, NULL);
+    free(cui__android_clip_buf);
+    cui__android_clip_buf = result;
+    return result ? result : "";
 }
 
 /* ---- soft keyboard ---- */
@@ -211,32 +267,54 @@ static cui_key cui__android_key(int32_t code); /* defined below; used by the tex
  * else is typed as-is. */
 static struct {
     pthread_mutex_t lock;
-    char *items[64];
-    int head, tail;
-} cui__android_textq = { PTHREAD_MUTEX_INITIALIZER };
+    char **items;
+    int head, tail, cap;   /* ring of `cap` slots; cap-1 in use */
+} cui__android_textq = { PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0, 0 };
 
-static void cui__android_textq_push(const char *utf8) {
+/* grows the ring instead of dropping items: a lost deletion or a lost
+ * composition rewrite desyncs the screen from the IME with no recovery */
+static bool cui__android_textq_push(const char *utf8) {
+    bool ok = false;
     pthread_mutex_lock(&cui__android_textq.lock);
-    int next = (cui__android_textq.tail + 1) % 64;
-    if (next != cui__android_textq.head) {
-        free(cui__android_textq.items[cui__android_textq.tail]);
-        cui__android_textq.items[cui__android_textq.tail] = strdup(utf8);
-        cui__android_textq.tail = next;
+    int cap = cui__android_textq.cap;
+    int used = cap ? (cui__android_textq.tail - cui__android_textq.head + cap) % cap : 0;
+    if (used == cap - 1 || cap == 0) {
+        int newcap = cap ? cap * 2 : 16;
+        char **grown = realloc(cui__android_textq.items, (size_t)newcap * sizeof *grown);
+        if (grown) {
+            /* unwrap the ring into 0..used so head stays at 0 */
+            for (int i = 0; i < used; i++)
+                grown[i] = cui__android_textq.items[(cui__android_textq.head + i) % cap];
+            cui__android_textq.items = grown;
+            cui__android_textq.head = 0;
+            cui__android_textq.tail = used;
+            cui__android_textq.cap = newcap;
+            cap = newcap;
+        }
+    }
+    if (used < cap - 1) {
+        char *dup = strdup(utf8);
+        if (dup) {
+            cui__android_textq.items[cui__android_textq.tail] = dup;
+            cui__android_textq.tail = (cui__android_textq.tail + 1) % cui__android_textq.cap;
+            ok = true;
+        }
     }
     pthread_mutex_unlock(&cui__android_textq.lock);
     /* JNI pushes arrive on the UI thread and do not wake the glue thread's
      * ALooper; without this the text sits in the queue until the next poll
      * timeout (cursor blink), visibly delaying it */
     ALooper_wake(cui__android_activity->looper);
+    return ok;
 }
 
 static void cui__android_textq_drain(cui_app *app) {
     for (;;) {
         pthread_mutex_lock(&cui__android_textq.lock);
-        char *item = cui__android_textq.items[cui__android_textq.head];
+        char *item = cui__android_textq.cap ? cui__android_textq.items[cui__android_textq.head] : NULL;
         if (!item) { pthread_mutex_unlock(&cui__android_textq.lock); return; }
         cui__android_textq.items[cui__android_textq.head] = NULL;
-        cui__android_textq.head = (cui__android_textq.head + 1) % 64;
+        cui__android_textq.head = (cui__android_textq.head + 1) % cui__android_textq.cap;
         pthread_mutex_unlock(&cui__android_textq.lock);
         if (*item == '\b') {
             /* deleteSurroundingText outside the composing span */
@@ -260,6 +338,11 @@ static void cui__android_textq_drain(cui_app *app) {
                 cui_input_key(app->ui, k, true, 0);
                 cui_input_key(app->ui, k, false, 0);
             }
+        } else if (*item == '\x04') {
+            /* deleteSurroundingText(afterLength): a forward delete; CUI's
+             * DELETE key matches one codepoint per press like BACKSPACE */
+            cui_input_key(app->ui, CUI_KEY_DELETE, true, 0);
+            cui_input_key(app->ui, CUI_KEY_DELETE, false, 0);
         } else if (*item) {
             cui_input_text(app->ui, item);
         }
@@ -273,31 +356,14 @@ __attribute__((visibility("default")))
 void Java_org_cui_hello_CuiActivity_nativeCommitText(JNIEnv *env, jobject thiz, jstring text) {
     (void)thiz;
     if (!text) return;
-    /* GetStringUTFChars returns modified UTF-8 whose supplementary code
-     * points (emoji) are 6-byte surrogate-pair encodings, not real UTF-8;
-     * use GetStringChars (UTF-16) and convert surrogates ourselves */
-    jsize len = (*env)->GetStringLength(env, text);
-    const jchar *u16 = (*env)->GetStringChars(env, text, NULL);
-    if (!u16) return;
-    char *utf8 = malloc((size_t)len * 4 + 1);
+    /* GetStringChars returns UTF-16; convert to standard UTF-8 ourselves —
+     * GetStringUTFChars would give modified UTF-8 with 6-byte surrogate
+     * encodings for emoji */
+    char *utf8 = cui__android_utf16_to_utf8(env, text);
     if (utf8) {
-        int n = 0;
-        for (jsize i = 0; i < len; ) {
-            unsigned int c = u16[i++];
-            if (c >= 0xD800 && c <= 0xDBFF && i < len && u16[i] >= 0xDC00 && u16[i] <= 0xDFFF)
-                c = 0x10000 + ((c - 0xD800) << 10) + (u16[i++] - 0xDC00);
-            else if (c >= 0xD800 && c <= 0xDFFF)
-                continue; /* lone surrogate: skip */
-            if (c < 0x80) utf8[n++] = (char)c;
-            else if (c < 0x800) { utf8[n++] = (char)(0xC0 | (c >> 6)); utf8[n++] = (char)(0x80 | (c & 0x3F)); }
-            else if (c < 0x10000) { utf8[n++] = (char)(0xE0 | (c >> 12)); utf8[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); utf8[n++] = (char)(0x80 | (c & 0x3F)); }
-            else { utf8[n++] = (char)(0xF0 | (c >> 18)); utf8[n++] = (char)(0x80 | ((c >> 12) & 0x3F)); utf8[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); utf8[n++] = (char)(0x80 | (c & 0x3F)); }
-        }
-        utf8[n] = 0;
         cui__android_textq_push(utf8);
         free(utf8);
     }
-    (*env)->ReleaseStringChars(env, text, u16);
 }
 
 /* the Java side replaced its composing span: delete the n codepoints it
@@ -314,6 +380,12 @@ __attribute__((visibility("default")))
 void Java_org_cui_hello_CuiActivity_nativeDeleteChars(JNIEnv *env, jobject thiz, jint n) {
     (void)env; (void)thiz;
     for (jint i = 0; i < n; i++) cui__android_textq_push("\b");
+}
+
+__attribute__((visibility("default")))
+void Java_org_cui_hello_CuiActivity_nativeDeleteCharsForward(JNIEnv *env, jobject thiz, jint n) {
+    (void)env; (void)thiz;
+    if (!cui__android_textq_push("\x04")) return;
 }
 
 /* soft-keyboard key event (backspace, arrows, enter) from sendKeyEvent;
@@ -507,6 +579,34 @@ static bool cui__android_key_event(cui_app *app, AInputEvent *ev) {
     return handled;
 }
 
+static int32_t cui__android_win_xy[2];   /* last known window origin on screen */
+
+static void cui__android_window_origin(cui__android *a) {
+    /* the NDK exposes no window origin; ask the activity over JNI so
+     * split-screen or offset windows map raw screen coordinates locally */
+    android_app *act = a ? a->act : cui__android_activity;
+    if (!act) return;
+    JNIEnv *env = cui__android_jni(act);
+    if (!env) return;
+    jclass cls = (*env)->GetObjectClass(env, act->activity->clazz);
+    jmethodID loc = cls ? (*env)->GetMethodID(env, cls, "getLocationOnScreen", "([I)V") : NULL;
+    jintArray arr = loc ? (*env)->NewIntArray(env, 2) : NULL;
+    if (loc && arr) {
+        (*env)->CallVoidMethod(env, act->activity->clazz, loc, arr);
+        if (!(*env)->ExceptionCheck(env)) {
+            jint *p = (*env)->GetIntArrayElements(env, arr, NULL);
+            if (p) {
+                cui__android_win_xy[0] = p[0];
+                cui__android_win_xy[1] = p[1];
+                (*env)->ReleaseIntArrayElements(env, arr, p, JNI_ABORT);
+            }
+        }
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    }
+    if (arr) (*env)->DeleteLocalRef(env, arr);
+    if (cls) (*env)->DeleteLocalRef(env, cls);
+}
+
 static void cui__android_motion_event(cui_app *app, AInputEvent *ev) {
     cui__android *a = cui__a(app);
     cui_ctx *ui = app->ui;
@@ -523,7 +623,10 @@ static void cui__android_motion_event(cui_app *app, AInputEvent *ev) {
         int w = a->act->window ? ANativeWindow_getWidth(a->act->window) : a->ges_w;
         int h = a->act->window ? ANativeWindow_getHeight(a->act->window) : a->ges_h;
         if (w != a->ges_w || h != a->ges_h) {
-            if ((action & AMOTION_EVENT_ACTION_MASK) != AMOTION_EVENT_ACTION_UP) return;
+            uint32_t base = action & AMOTION_EVENT_ACTION_MASK;
+            /* CANCEL must pass through even after the resize: it is the only
+             * path that ends a gesture the input system abandons */
+            if (base != AMOTION_EVENT_ACTION_UP && base != AMOTION_EVENT_ACTION_CANCEL) return;
             cui_input_mouse_move(ui, a->down_x / s, a->down_y / s);
             cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
             a->has_pointer = false;
@@ -561,8 +664,12 @@ static void cui__android_motion_event(cui_app *app, AInputEvent *ev) {
     int raw_idx = idx;
     if (AMotionEvent_getRawX(ev, idx) == 0 &&
         AMotionEvent_getRawX(ev, 0) != 0) raw_idx = 0;   /* per-pointer raw unsupported */
-    float x = AMotionEvent_getRawX(ev, raw_idx) / s;
-    float y = AMotionEvent_getRawY(ev, raw_idx) / s;
+    /* raw coordinates are screen-relative; subtract the window origin
+     * (refreshed per event, usually 0 for this top-anchored fullscreen
+     * window) so split-screen windows map taps to their local positions */
+    cui__android_window_origin(a);
+    float x = (AMotionEvent_getRawX(ev, raw_idx) - (float)cui__android_win_xy[0]) / s;
+    float y = (AMotionEvent_getRawY(ev, raw_idx) - (float)cui__android_win_xy[1]) / s;
     switch (action & AMOTION_EVENT_ACTION_MASK) {
     case AMOTION_EVENT_ACTION_DOWN:
         if (a->act->window) {

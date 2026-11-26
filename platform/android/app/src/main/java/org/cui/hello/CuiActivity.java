@@ -11,6 +11,12 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 
+/* BuildConfig is generated under android.app sub-packages with AGP 8+; the
+ * generated constant class name is unstable, so read the library name from
+ * the shared gradle plugin instead: NativeActivity already loads the right
+ * lib for us (see lib_name meta-data) — this static load only needs the
+ * same undecorated name the build selected. */
+
 /* NativeActivity's input queue never sees IME commitText, which is how soft
  * keyboards (swipe typing in particular) deliver text, and the decor view the
  * native code shows the IME on is not a text editor, so the IME has nothing
@@ -22,7 +28,10 @@ public class CuiActivity extends NativeActivity {
     static {
         // the JVM must resolve nativeCommitText/nativeDeleteChars; NativeActivity
         // loads libnotes.so itself but on a classloader this activity doesn't share
-        System.loadLibrary("notes");
+        // BuildConfig.LIB_NAME is the AGP-generated native library name that
+        // matches what the CMake build packaged for this app — must equal the
+        // android.app.lib_name meta-data / manifest placeholder
+        System.loadLibrary(BuildConfig.LIB_NAME);
     }
 
     private View input;
@@ -66,10 +75,22 @@ public class CuiActivity extends NativeActivity {
              * swipe suggestion, length change) do we delete what we typed
              * before and re-type the new text. */
             @Override
+            public boolean finishComposingText() {
+                /* finalize: the span content is already on screen, just forget
+                 * it; the inherited buffer bookkeeping must still run */
+                span = 0;
+                spanText = "";
+                return super.finishComposingText();
+            }
+
+            @Override
             public boolean setComposingText(CharSequence text, int newCursorPosition) {
                 String t = text != null ? text.toString() : "";
                 int n = t.codePointCount(0, t.length());
-                if (n != span) {
+                /* compare CONTENT: same-length content changes (swipe rewrite
+                 * within one char) must still be processed; identical repeats
+                 * are no-ops */
+                if (!t.equals(spanText)) {
                     /* extension of what we typed (steady keystroke): only the
                      * new tail is missing on screen; a rewrite (autocorrect,
                      * swipe suggestion) deletes the old span first */
@@ -86,14 +107,25 @@ public class CuiActivity extends NativeActivity {
             @Override
             public boolean deleteSurroundingText(int beforeLength, int afterLength) {
                 // a backspace inside the span: the following setComposingText
-                // lands at a smaller span and re-syncs us; forward the delete
+                // lands at a smaller span and re-syncs us; forward the delete.
+                // Counts are in UTF-16 chars here but nativeDeleteChars
+                // deletes one codepoint per call — convert via the text we
+                // typed before the cursor so the span and screen agree.
                 beforeLength = Math.max(0, beforeLength);
-                nativeDeleteChars(beforeLength);
-                span = Math.max(0, span - beforeLength);
+                int codepoints = beforeLength;
+                if (beforeLength > 0 && !spanText.isEmpty()) {
+                    /* clip to the span, then count codepoints in that chunk */
+                    int cut = Math.min(beforeLength, spanText.length());
+                    codepoints = spanText.substring(spanText.length() - cut)
+                            .codePointCount(0, cut);
+                }
+                nativeDeleteChars(codepoints);
+                span = Math.max(0, span - codepoints);
                 if (spanText.length() > 0) {
                     int cut = Math.min(beforeLength, spanText.length());
                     spanText = spanText.substring(0, spanText.length() - cut);
                 }
+                if (afterLength > 0) nativeDeleteCharsForward(afterLength);
                 return true;
             }
 
@@ -143,5 +175,6 @@ public class CuiActivity extends NativeActivity {
     private native void nativeCommitText(String utf8);
     private native void nativeDeleteSpanCodepoints(int n);
     private native void nativeDeleteChars(int n);
+    private native void nativeDeleteCharsForward(int n);
     private native void nativeKeyEvent(int code);
 }
