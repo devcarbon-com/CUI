@@ -8,11 +8,13 @@
 
 #include <android/native_activity.h>
 #include <android/keycodes.h>
-#include <android/log.h>
 #include <android_native_app_glue.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <jni.h>
+#include <android/log.h>
+#define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, "cui", __VA_ARGS__))
+#include <pthread.h>
 #include <time.h>
 
 typedef struct android_app android_app;
@@ -29,6 +31,7 @@ typedef struct {
     bool has_pointer;
     int tracked_id;        /* motion pointer id that owns the mouse (-1 none) */
     bool vsync;            /* swap interval to reapply when the surface is recreated */
+    bool kb_shown;         /* soft keyboard requested for the current editing session */
 } cui__android;
 
 static cui__android *cui__a(cui_app *app) { return app->plat; }
@@ -97,6 +100,176 @@ bool cui__plat_file_dialog(cui_app *app, const cui_file_dialog_opts *o, char *ou
     (void)app; (void)o;
     if (cap) out[0] = 0;
     return false;
+}
+
+/* ---- clipboard: ClipboardManager over JNI ---- */
+
+static void cui__android_set_clipboard(void *user, const char *utf8) {
+    (void)user;
+    android_app *act = cui__android_activity;
+    if (!act || !utf8) return;
+    JNIEnv *env = cui__android_jni(act);
+    if (!env) return;
+    jstring jtext = (*env)->NewStringUTF(env, utf8);
+    if (!jtext) { (*env)->ExceptionClear(env); return; }
+    jclass ctx_cls = (*env)->GetObjectClass(env, act->activity->clazz);
+    jfieldID svc_field = (*env)->GetStaticFieldID(env, ctx_cls, "CLIPBOARD_SERVICE",
+        "Ljava/lang/String;");
+    jstring svc = svc_field ? (*env)->GetStaticObjectField(env, ctx_cls, svc_field) : NULL;
+    jmethodID get_sys = svc ? (*env)->GetMethodID(env, ctx_cls, "getSystemService",
+        "(Ljava/lang/String;)Ljava/lang/Object;") : NULL;
+    jobject cm = (svc && get_sys) ? (*env)->CallObjectMethod(env, act->activity->clazz, get_sys, svc) : NULL;
+    if (cm) {
+        jclass cm_cls = (*env)->GetObjectClass(env, cm);
+        jmethodID set = (*env)->GetMethodID(env, cm_cls, "setPrimaryClip",
+            "(Landroid/content/ClipData;)V");
+        jclass cd_cls = (*env)->FindClass(env, "android/content/ClipData");
+        jmethodID new_cd = cd_cls ? (*env)->GetStaticMethodID(env, cd_cls, "newPlainText",
+            "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;") : NULL;
+        if (set && new_cd) {
+            jobject cd = (*env)->CallStaticObjectMethod(env, cd_cls, new_cd, NULL, jtext);
+            if (cd && !(*env)->ExceptionCheck(env))
+                (*env)->CallVoidMethod(env, cm, set, cd);
+            if (cd) (*env)->DeleteLocalRef(env, cd);
+        }
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        if (cd_cls) (*env)->DeleteLocalRef(env, cd_cls);
+        (*env)->DeleteLocalRef(env, cm_cls);
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, ctx_cls);
+    if (svc) (*env)->DeleteLocalRef(env, svc);
+    if (cm) (*env)->DeleteLocalRef(env, cm);
+    (*env)->DeleteLocalRef(env, jtext);
+}
+
+static const char *cui__android_get_clipboard(void *user) {
+    (void)user;
+    android_app *act = cui__android_activity;
+    if (!act) return "";
+    JNIEnv *env = cui__android_jni(act);
+    if (!env) return "";
+    jclass ctx_cls = (*env)->GetObjectClass(env, act->activity->clazz);
+    jfieldID svc_field = (*env)->GetStaticFieldID(env, ctx_cls, "CLIPBOARD_SERVICE",
+        "Ljava/lang/String;");
+    jstring svc = svc_field ? (*env)->GetStaticObjectField(env, ctx_cls, svc_field) : NULL;
+    jmethodID get_sys = svc ? (*env)->GetMethodID(env, ctx_cls, "getSystemService",
+        "(Ljava/lang/String;)Ljava/lang/Object;") : NULL;
+    jobject cm = (svc && get_sys) ? (*env)->CallObjectMethod(env, act->activity->clazz, get_sys, svc) : NULL;
+    if (cm) {
+        jclass cm_cls = (*env)->GetObjectClass(env, cm);
+        jmethodID get_primary = (*env)->GetMethodID(env, cm_cls, "getPrimaryClip",
+            "()Landroid/content/ClipData;");
+        jobject cd = get_primary ? (*env)->CallObjectMethod(env, cm, get_primary) : NULL;
+        if (cd) {
+            jmethodID item_at = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, cd),
+                "getItemAt", "(I)Landroid/content/ClipData$Item;");
+            jmethodID count = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, cd), "getItemCount", "()I");
+            jint n = count ? (*env)->CallIntMethod(env, cd, count) : 0;
+            jobject item = (item_at && n > 0) ? (*env)->CallObjectMethod(env, cd, item_at, (jint)0) : NULL;
+            if (item) {
+                jmethodID get_text = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, item),
+                    "coerceToText", "(Landroid/content/Context;)Ljava/lang/CharSequence;");
+                jobject text = get_text ? (*env)->CallObjectMethod(env, item, get_text,
+                    act->activity->clazz) : NULL;
+                if (text) {
+                    jmethodID to_str = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, text),
+                        "toString", "()Ljava/lang/String;");
+                    jstring jstr = to_str ? (*env)->CallObjectMethod(env, text, to_str) : NULL;
+                    if (jstr) {
+                        const char *utf8 = (*env)->GetStringUTFChars(env, jstr, NULL);
+                        if (utf8) {
+                            /* truncated clipboard is better than a crash: cui caps at 8MB */
+                            static char buf[1 << 16];
+                            snprintf(buf, sizeof buf, "%s", utf8);
+                            (*env)->ReleaseStringUTFChars(env, jstr, utf8);
+                            return buf;
+                        }
+                    }
+                }
+            }
+        }
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, cm_cls);
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, ctx_cls);
+    if (svc) (*env)->DeleteLocalRef(env, svc);
+    if (cm) (*env)->DeleteLocalRef(env, cm);
+    return "";
+}
+
+/* ---- soft keyboard ---- */
+
+/* commitText (swipe typing, accents, emoji) never reaches the NativeActivity
+ * input queue and the C API cannot read the characters, so CuiActivity
+ * forwards it over JNI from the UI thread; cui__plat_wait drains it on the
+ * glue thread each frame. */
+static struct {
+    pthread_mutex_t lock;
+    char *items[64];
+    int head, tail;
+} cui__android_textq = { PTHREAD_MUTEX_INITIALIZER };
+
+static void cui__android_textq_push(const char *utf8) {
+    LOGI("commitText: '%s'", utf8);
+    pthread_mutex_lock(&cui__android_textq.lock);
+    int next = (cui__android_textq.tail + 1) % 64;
+    if (next != cui__android_textq.head) {
+        free(cui__android_textq.items[cui__android_textq.tail]);
+        cui__android_textq.items[cui__android_textq.tail] = strdup(utf8);
+        cui__android_textq.tail = next;
+    }
+    pthread_mutex_unlock(&cui__android_textq.lock);
+}
+
+static void cui__android_textq_drain(cui_app *app) {
+    for (;;) {
+        pthread_mutex_lock(&cui__android_textq.lock);
+        char *item = cui__android_textq.items[cui__android_textq.head];
+        if (!item) { pthread_mutex_unlock(&cui__android_textq.lock); return; }
+        cui__android_textq.items[cui__android_textq.head] = NULL;
+        cui__android_textq.head = (cui__android_textq.head + 1) % 64;
+        pthread_mutex_unlock(&cui__android_textq.lock);
+        if (*item == '\b') {
+            /* deleteSurroundingText queued as backspaces */
+            cui_input_key(app->ui, CUI_KEY_BACKSPACE, true, 0);
+            cui_input_key(app->ui, CUI_KEY_BACKSPACE, false, 0);
+        } else if (*item) {
+            cui_input_text(app->ui, item);
+        }
+        free(item);
+    }
+}
+
+/* JNI entry points for CuiActivity (org.cui.hello); default visibility so
+ * the JVM can look them up by name */
+__attribute__((visibility("default")))
+void Java_org_cui_hello_CuiActivity_nativeCommitText(JNIEnv *env, jobject thiz, jstring text) {
+    (void)thiz;
+    if (!text) return;
+    const char *utf8 = (*env)->GetStringUTFChars(env, text, NULL);
+    if (utf8) { cui__android_textq_push(utf8); (*env)->ReleaseStringUTFChars(env, text, utf8); }
+}
+
+/* "\b" control items from deleteSurroundingText become backspace keys */
+__attribute__((visibility("default")))
+void Java_org_cui_hello_CuiActivity_nativeDeleteChars(JNIEnv *env, jobject thiz, jint n) {
+    (void)env; (void)thiz;
+    for (jint i = 0; i < n; i++) cui__android_textq_push("\b");
+}
+
+/* The IME must be driven from the UI thread; CuiActivity.showKeyboard posts
+ * there, and its CuiInputView is the text-editor view the IME connects to. */
+static void cui__android_show_kb(struct android_app *act, bool show) {
+    JNIEnv *env = cui__android_jni(act);
+    if (!env) return;
+    jclass cls = (*env)->GetObjectClass(env, act->activity->clazz);
+    jmethodID m = cls ? (*env)->GetMethodID(env, cls, show ? "showKeyboard" : "hideKeyboard", "()V") : NULL;
+    if (m && !(*env)->ExceptionCheck(env))
+        (*env)->CallVoidMethod(env, act->activity->clazz, m);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (cls) (*env)->DeleteLocalRef(env, cls);
 }
 
 /* ---- lifecycle commands from the glue thread ---- */
@@ -197,11 +370,25 @@ static bool cui__android_key_event(cui_app *app, AInputEvent *ev) {
     int32_t action = AKeyEvent_getAction(ev);
     bool down = action == AKEY_EVENT_ACTION_DOWN;
     int32_t meta = AKeyEvent_getMetaState(ev);
-    cui_key k = cui__android_key(AKeyEvent_getKeyCode(ev));
+    int32_t code = AKeyEvent_getKeyCode(ev);
+    /* IME edit actions (clipboard toolbar paste/copy/cut) arrive as these
+     * key codes; map them onto the textedit Ctrl shortcuts */
+    switch (code) {
+    case AKEYCODE_PASTE:    code = AKEYCODE_V; meta |= AMETA_CTRL_ON; break;
+    case AKEYCODE_COPY:     code = AKEYCODE_C; meta |= AMETA_CTRL_ON; break;
+    case AKEYCODE_CUT:      code = AKEYCODE_X; meta |= AMETA_CTRL_ON; break;
+    default: break;
+    }
+    cui_key k = cui__android_key(code);
     int mods = cui__android_mods(meta);
     bool handled = false;
     char text[8] = "";
-    if (down && !(mods & CUI_MOD_CTRL)) {
+    /* CuiActivity's InputConnection delivers soft-keyboard text via JNI;
+     * synthesizing it here too would double every character. Soft-keyboard
+     * events that survive the bridge are only non-text keys (enter, arrows). */
+    if (down && !(AKeyEvent_getFlags(ev) & AKEY_EVENT_FLAG_SOFT_KEYBOARD)
+             && code != AKEYCODE_PASTE && code != AKEYCODE_COPY
+             && code != AKEYCODE_CUT && !(mods & CUI_MOD_CTRL)) {
         /* soft-keyboard text: the code point is not exposed by the C API,
          * ask the Java KeyEvent (also for mapped keys, for shifted symbols) */
         android_app *act = cui__a(app)->act;
@@ -306,6 +493,12 @@ static void cui__android_motion_event(cui_app *app, AInputEvent *ev) {
 static int32_t cui__android_input(android_app *act, AInputEvent *ev) {
     cui_app *app = (cui_app *)act->userData;
     if (!app) return 0;
+    if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_MOTION)
+        LOGI("motion act=%d x=%.0f y=%.0f", AMotionEvent_getAction(ev),
+            AMotionEvent_getX(ev, 0), AMotionEvent_getY(ev, 0));
+    else
+        LOGI("key act=%d code=%d flags=%x", AKeyEvent_getAction(ev),
+            AKeyEvent_getKeyCode(ev), AKeyEvent_getFlags(ev));
     switch (AInputEvent_getType(ev)) {
     case AINPUT_EVENT_TYPE_MOTION:
         cui__android_motion_event(app, ev);
@@ -445,6 +638,8 @@ bool cui__plat_init(cui_app *app) {
     cui_platform_iface pi;
     memset(&pi, 0, sizeof pi);
     pi.user = app;
+    pi.set_clipboard = cui__android_set_clipboard;
+    pi.get_clipboard = cui__android_get_clipboard;
     cui_set_platform(app->ui, &pi);
     /* block until the surface exists so the first frame has a size */
     int events = 0;
@@ -514,11 +709,24 @@ void cui__plat_metrics(cui_app *app, float *w, float *h, float *scale, int *fb_w
 
 void cui__plat_wait(cui_app *app, double timeout) {
     cui__android *a = cui__a(app);
+    /* show/hide the soft keyboard when a text edit gains or loses focus; the
+     * latch avoids spamming the IME every frame */
+    bool wants = cui_wants_keyboard(app->ui);
+    if (wants && !a->kb_shown) {
+        a->kb_shown = true;
+        LOGI("kb show (wants=%d)", wants);
+        cui__android_show_kb(a->act, true);
+    } else if (!wants && a->kb_shown) {
+        a->kb_shown = false;
+        LOGI("kb hide");
+        cui__android_show_kb(a->act, false);
+    }
     int events = 0;
     struct android_poll_source *src = NULL;
     int ms = timeout < 0 ? -1 : (int)(timeout * 1000);
     int r = ALooper_pollOnce(ms, NULL, &events, (void **)&src);
     if (r >= 0 && src) src->process(a->act, src);
+    cui__android_textq_drain(app);
     if (a->act->destroyRequested) app->running = false;
 }
 
