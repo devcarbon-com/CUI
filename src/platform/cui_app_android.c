@@ -262,9 +262,9 @@ static cui_key cui__android_key(int32_t code); /* defined below; used by the tex
 /* commitText (swipe typing, accents, emoji) never reaches the NativeActivity
  * input queue and the C API cannot read the characters, so CuiActivity
  * forwards it over JNI from the UI thread; cui__plat_wait drains it on the
- * glue thread each frame. Queue items are tagged: '\b' deletes one char,
- * "\x02<n>:" deletes the whole composing span (Java bookkeeps it), anything
- * else is typed as-is. */
+ * glue thread each frame. A committed string is prefixed with '\x01' so a
+ * text whose first byte is a tag byte ("\u00043" pasted from the IME) cannot
+ * be mistaken for a command; command items start '\b', '\x02', '\x03', '\x04'. */
 static struct {
     pthread_mutex_t lock;
     char **items;
@@ -347,13 +347,26 @@ static void cui__android_textq_drain(cui_app *app) {
             }
         } else if (*item == '\x04') {
             /* deleteSurroundingText(afterLength): a forward delete of n
-             * codepoints, counted like the backspace path */
+             * codepoints. kpresseds cap at 255 per key per frame (cui_core.c),
+             * so a larger request is split: consume what a frame holds and
+             * re-queue the remainder for the next drain */
             int n = atoi(item + 1);
-            for (int i = 0; i < n; i++) {
+            int batch = n < 255 ? n : 255;
+            for (int i = 0; i < batch; i++) {
                 cui_input_key(app->ui, CUI_KEY_DELETE, true, 0);
                 cui_input_key(app->ui, CUI_KEY_DELETE, false, 0);
             }
+            if (n > batch) {
+                char tag[24];
+                snprintf(tag, sizeof tag, "\x04%d", n - batch);
+                cui__android_textq_push(tag);
+            }
+        } else if (*item == '\x01') {
+            /* committed text: strip the tag byte so a pasted or composed
+             * string starting with a command byte is typed verbatim */
+            cui_input_text(app->ui, item + 1);
         } else if (*item) {
+            /* legacy untranslated callers (native_app_glue synthesizers) */
             cui_input_text(app->ui, item);
         }
         free(item);
@@ -371,7 +384,15 @@ void Java_org_cui_hello_CuiActivity_nativeCommitText(JNIEnv *env, jobject thiz, 
      * encodings for emoji */
     char *utf8 = cui__android_utf16_to_utf8(env, text);
     if (utf8) {
-        cui__android_textq_push(utf8);
+        /* prefix so committed text can never collide with a command tag */
+        size_t n = strlen(utf8);
+        char *tagged = malloc(n + 2);
+        if (tagged) {
+            tagged[0] = '\x01';
+            memcpy(tagged + 1, utf8, n + 1);
+            cui__android_textq_push(tagged);
+            free(tagged);
+        }
         free(utf8);
     }
 }

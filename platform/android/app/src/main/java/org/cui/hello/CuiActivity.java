@@ -131,11 +131,19 @@ public class CuiActivity extends NativeActivity {
             public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
                 beforeLength = Math.max(0, beforeLength);
                 afterLength = Math.max(0, afterLength);
-                nativeDeleteChars(beforeLength);
-                span = Math.max(0, span - beforeLength);
+                /* surrounding range, not plain backspace/delete: only the
+                 * text before and after the (possibly selected) range goes;
+                 * the in-range selection itself is preserved. The selection
+                 * is the composing span, so it sits between the before and
+                 * after runs. */
                 int end = spanText.length();
                 for (int i = 0; i < beforeLength && end > 0; i++)
                     end = spanText.offsetByCodePoints(end, -1);
+                int after = spanText.length() - end;
+                nativeDeleteChars(beforeLength);
+                if (after > 0)
+                    nativeDeleteSpanCodepoints(after);
+                span = Math.max(0, span - beforeLength - after - afterLength);
                 spanText = spanText.substring(0, end);
                 if (afterLength > 0) nativeDeleteCharsForward(afterLength);
                 return true;
