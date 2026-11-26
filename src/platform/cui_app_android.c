@@ -14,6 +14,7 @@
 #include <jni.h>
 #include <pthread.h>
 #include <time.h>
+#include <stdlib.h>
 
 typedef struct android_app android_app;
 
@@ -200,10 +201,14 @@ static const char *cui__android_get_clipboard(void *user) {
 
 /* ---- soft keyboard ---- */
 
+static cui_key cui__android_key(int32_t code); /* defined below; used by the textq drain */
+
 /* commitText (swipe typing, accents, emoji) never reaches the NativeActivity
  * input queue and the C API cannot read the characters, so CuiActivity
  * forwards it over JNI from the UI thread; cui__plat_wait drains it on the
- * glue thread each frame. */
+ * glue thread each frame. Queue items are tagged: '\b' deletes one char,
+ * "\x02<n>:" deletes the whole composing span (Java bookkeeps it), anything
+ * else is typed as-is. */
 static struct {
     pthread_mutex_t lock;
     char *items[64];
@@ -219,6 +224,10 @@ static void cui__android_textq_push(const char *utf8) {
         cui__android_textq.tail = next;
     }
     pthread_mutex_unlock(&cui__android_textq.lock);
+    /* JNI pushes arrive on the UI thread and do not wake the glue thread's
+     * ALooper; without this the text sits in the queue until the next poll
+     * timeout (cursor blink), visibly delaying it */
+    ALooper_wake(cui__android_activity->looper);
 }
 
 static void cui__android_textq_drain(cui_app *app) {
@@ -230,9 +239,27 @@ static void cui__android_textq_drain(cui_app *app) {
         cui__android_textq.head = (cui__android_textq.head + 1) % 64;
         pthread_mutex_unlock(&cui__android_textq.lock);
         if (*item == '\b') {
-            /* deleteSurroundingText queued as backspaces */
+            /* deleteSurroundingText outside the composing span */
             cui_input_key(app->ui, CUI_KEY_BACKSPACE, true, 0);
             cui_input_key(app->ui, CUI_KEY_BACKSPACE, false, 0);
+        } else if (*item == '\x02') {
+            /* the Java side replaced its composing span: delete the chars it
+             * had us type for the old one */
+            int n = atoi(item + 1);
+            for (int i = 0; i < n; i++) {
+                cui_input_key(app->ui, CUI_KEY_BACKSPACE, true, 0);
+                cui_input_key(app->ui, CUI_KEY_BACKSPACE, false, 0);
+            }
+        } else if (*item == '\x03') {
+            /* soft-keyboard key event (backspace, arrows, enter) forwarded
+             * from CuiActivity.sendKeyEvent — these never reach the native
+             * input queue */
+            int code = atoi(item + 1);
+            cui_key k = cui__android_key(code);
+            if (k != CUI_KEY_NONE) {
+                cui_input_key(app->ui, k, true, 0);
+                cui_input_key(app->ui, k, false, 0);
+            }
         } else if (*item) {
             cui_input_text(app->ui, item);
         }
@@ -246,15 +273,57 @@ __attribute__((visibility("default")))
 void Java_org_cui_hello_CuiActivity_nativeCommitText(JNIEnv *env, jobject thiz, jstring text) {
     (void)thiz;
     if (!text) return;
-    const char *utf8 = (*env)->GetStringUTFChars(env, text, NULL);
-    if (utf8) { cui__android_textq_push(utf8); (*env)->ReleaseStringUTFChars(env, text, utf8); }
+    /* GetStringUTFChars returns modified UTF-8 whose supplementary code
+     * points (emoji) are 6-byte surrogate-pair encodings, not real UTF-8;
+     * use GetStringChars (UTF-16) and convert surrogates ourselves */
+    jsize len = (*env)->GetStringLength(env, text);
+    const jchar *u16 = (*env)->GetStringChars(env, text, NULL);
+    if (!u16) return;
+    char *utf8 = malloc((size_t)len * 4 + 1);
+    if (utf8) {
+        int n = 0;
+        for (jsize i = 0; i < len; ) {
+            unsigned int c = u16[i++];
+            if (c >= 0xD800 && c <= 0xDBFF && i < len && u16[i] >= 0xDC00 && u16[i] <= 0xDFFF)
+                c = 0x10000 + ((c - 0xD800) << 10) + (u16[i++] - 0xDC00);
+            else if (c >= 0xD800 && c <= 0xDFFF)
+                continue; /* lone surrogate: skip */
+            if (c < 0x80) utf8[n++] = (char)c;
+            else if (c < 0x800) { utf8[n++] = (char)(0xC0 | (c >> 6)); utf8[n++] = (char)(0x80 | (c & 0x3F)); }
+            else if (c < 0x10000) { utf8[n++] = (char)(0xE0 | (c >> 12)); utf8[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); utf8[n++] = (char)(0x80 | (c & 0x3F)); }
+            else { utf8[n++] = (char)(0xF0 | (c >> 18)); utf8[n++] = (char)(0x80 | ((c >> 12) & 0x3F)); utf8[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); utf8[n++] = (char)(0x80 | (c & 0x3F)); }
+        }
+        utf8[n] = 0;
+        cui__android_textq_push(utf8);
+        free(utf8);
+    }
+    (*env)->ReleaseStringChars(env, text, u16);
 }
 
-/* "\b" control items from deleteSurroundingText become backspace keys */
+/* the Java side replaced its composing span: delete the n codepoints it
+ * previously had us type (queued as a "\x02<n>" tag item) */
+__attribute__((visibility("default")))
+void Java_org_cui_hello_CuiActivity_nativeDeleteSpanCodepoints(JNIEnv *env, jobject thiz, jint n) {
+    (void)env; (void)thiz;
+    char tag[24];
+    snprintf(tag, sizeof tag, "\x02%d", (int)(n > 0 ? n : 0));
+    cui__android_textq_push(tag);
+}
+
 __attribute__((visibility("default")))
 void Java_org_cui_hello_CuiActivity_nativeDeleteChars(JNIEnv *env, jobject thiz, jint n) {
     (void)env; (void)thiz;
     for (jint i = 0; i < n; i++) cui__android_textq_push("\b");
+}
+
+/* soft-keyboard key event (backspace, arrows, enter) from sendKeyEvent;
+ * queued as a "\x03<code>" tag item */
+__attribute__((visibility("default")))
+void Java_org_cui_hello_CuiActivity_nativeKeyEvent(JNIEnv *env, jobject thiz, jint code) {
+    (void)env; (void)thiz;
+    char tag[24];
+    snprintf(tag, sizeof tag, "\x03%d", (int)code);
+    cui__android_textq_push(tag);
 }
 
 /* The IME must be driven from the UI thread; CuiActivity.showKeyboard posts
@@ -383,8 +452,12 @@ static bool cui__android_key_event(cui_app *app, AInputEvent *ev) {
     char text[8] = "";
     /* CuiActivity's InputConnection delivers soft-keyboard text via JNI;
      * synthesizing it here too would double every character. Soft-keyboard
-     * events that survive the bridge are only non-text keys (enter, arrows). */
-    if (down && !(AKeyEvent_getFlags(ev) & AKEY_EVENT_FLAG_SOFT_KEYBOARD)
+     * events that survive the bridge are only keys the bridge never sees
+     * (enter, arrows, and DEL — after a commit Gboard sends backspace as a
+     * key event instead of deleteSurroundingText). */
+    bool soft_del = AKeyEvent_getFlags(ev) & AKEY_EVENT_FLAG_SOFT_KEYBOARD
+        && (code == AKEYCODE_DEL || code == AKEYCODE_FORWARD_DEL);
+    if (down && (!(AKeyEvent_getFlags(ev) & AKEY_EVENT_FLAG_SOFT_KEYBOARD) || soft_del)
              && code != AKEYCODE_PASTE && code != AKEYCODE_COPY
              && code != AKEYCODE_CUT && !(mods & CUI_MOD_CTRL)) {
         /* soft-keyboard text: the code point is not exposed by the C API,
