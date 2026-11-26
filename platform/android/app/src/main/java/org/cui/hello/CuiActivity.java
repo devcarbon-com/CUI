@@ -129,22 +129,18 @@ public class CuiActivity extends NativeActivity {
              * through the UTF-16 conversion above — forward counts as-is */
             @Override
             public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
+                if (beforeLength == 0 && afterLength == 0) return true;
                 beforeLength = Math.max(0, beforeLength);
                 afterLength = Math.max(0, afterLength);
-                /* surrounding range, not plain backspace/delete: only the
-                 * text before and after the (possibly selected) range goes;
-                 * the in-range selection itself is preserved. The selection
-                 * is the composing span, so it sits between the before and
-                 * after runs. */
+                /* before: drop the requested range off the composed text;
+                 * after: text beyond the composing span is not ours to track,
+                 * only the document delete is queued */
                 int end = spanText.length();
                 for (int i = 0; i < beforeLength && end > 0; i++)
                     end = spanText.offsetByCodePoints(end, -1);
-                int after = spanText.length() - end;
-                nativeDeleteChars(beforeLength);
-                if (after > 0)
-                    nativeDeleteSpanCodepoints(after);
-                span = Math.max(0, span - beforeLength - after - afterLength);
                 spanText = spanText.substring(0, end);
+                span = spanText.codePointCount(0, spanText.length());
+                if (beforeLength > 0) nativeDeleteChars(beforeLength);
                 if (afterLength > 0) nativeDeleteCharsForward(afterLength);
                 return true;
             }
